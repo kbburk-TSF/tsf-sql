@@ -47,6 +47,8 @@ BEGIN
       %23$I             double precision,
       %24$I             double precision,
       %25$I             double precision,
+      %26$I             double precision,
+      %27$I             double precision,
       created_at        timestamptz DEFAULT now(),
       PRIMARY KEY (forecast_id, date)
     );
@@ -75,7 +77,9 @@ BEGIN
     model||'_fmsr_a2',      -- %22
     model||'_fmsr_a2w',     -- %23
     model||'_fmsr_a3',      -- %24
-    model||'_fmsr_a3w'      -- %25
+    model||'_fmsr_a3w',     -- %25
+    model||'_fqsr_a0',      -- %26
+    model||'_fmsr_a0'       -- %27
   );
 
   -- Grant write access immediately (so pipeline can INSERT/UPDATE)
@@ -115,35 +119,39 @@ BEGIN
       %23$I               double precision,
       %24$I               double precision,
       %25$I               double precision,
+      %26$I               double precision,
+      %27$I               double precision,
       created_at          timestamptz DEFAULT now(),
       PRIMARY KEY (forecast_id, date)
     );
   $q$,
     q_tbl,
-    model||'_q',            -- %2
-    model||'_yqm',          -- %3
-    model||'_smv',          -- %4
-    model||'_qsr',          -- %5
-    model||'_msr',          -- %6
-    model||'_q_p1_k',       -- %7
-    model||'_q_p1_qsr',     -- %8
-    model||'_q_p1_msr',     -- %9
-    model||'_q_p2_k',       -- %10
-    model||'_q_p2_qsr',     -- %11
-    model||'_q_p2_msr',     -- %12
-    model||'_q_p3_k',       -- %13
-    model||'_q_p3_qsr',     -- %14
-    model||'_q_p3_msr',     -- %15
-    model||'_q_fqsr_a1',    -- %16
-    model||'_q_fqsr_a2',    -- %17
-    model||'_q_fqsr_a2w',   -- %18
-    model||'_q_fqsr_a3',    -- %19
-    model||'_q_fqsr_a3w',   -- %20
-    model||'_q_fmsr_a1',    -- %21
-    model||'_q_fmsr_a2',    -- %22
-    model||'_q_fmsr_a2w',   -- %23
-    model||'_q_fmsr_a3',    -- %24
-    model||'_q_fmsr_a3w'    -- %25
+    model||'_q',           -- %2  <model>_q
+    model||'_q_yqm',       -- %3
+    model||'_q_smv',       -- %4
+    model||'_q_qsr',       -- %5
+    model||'_q_msr',       -- %6
+    model||'_q_p1_k',      -- %7
+    model||'_q_p1_qsr',    -- %8
+    model||'_q_p1_msr',    -- %9
+    model||'_q_p2_k',      -- %10
+    model||'_q_p2_qsr',    -- %11
+    model||'_q_p2_msr',    -- %12
+    model||'_q_p3_k',      -- %13
+    model||'_q_p3_qsr',    -- %14
+    model||'_q_p3_msr',    -- %15
+    model||'_q_fqsr_a1',   -- %16
+    model||'_q_fqsr_a2',   -- %17
+    model||'_q_fqsr_a2w',  -- %18
+    model||'_q_fqsr_a3',   -- %19
+    model||'_q_fqsr_a3w',  -- %20
+    model||'_q_fmsr_a1',   -- %21
+    model||'_q_fmsr_a2',   -- %22
+    model||'_q_fmsr_a2w',  -- %23
+    model||'_q_fmsr_a3',   -- %24
+    model||'_q_fmsr_a3w',  -- %25
+    model||'_q_fqsr_a0',   -- %26
+    model||'_q_fmsr_a0'    -- %27
   );
 
   EXECUTE format('GRANT SELECT, INSERT, UPDATE ON engine.%I TO PUBLIC;', q_tbl);
@@ -182,35 +190,39 @@ BEGIN
       %23$I               double precision,
       %24$I               double precision,
       %25$I               double precision,
+      %26$I               double precision,
+      %27$I               double precision,
       created_at          timestamptz DEFAULT now(),
       PRIMARY KEY (forecast_id, date)
     );
   $q$,
     qm_tbl,
-    model||'_qm',           -- %2
-    model||'_yqm',          -- %3
-    model||'_smv',          -- %4
-    model||'_qsr',          -- %5
-    model||'_msr',          -- %6
-    model||'_qm_p1_k',      -- %7
-    model||'_qm_p1_qsr',    -- %8
-    model||'_qm_p1_msr',    -- %9
-    model||'_qm_p2_k',      -- %10
-    model||'_qm_p2_qsr',    -- %11
-    model||'_qm_p2_msr',    -- %12
-    model||'_qm_p3_k',      -- %13
-    model||'_qm_p3_qsr',    -- %14
-    model||'_qm_p3_msr',    -- %15
-    model||'_qm_fqsr_a1',   -- %16
-    model||'_qm_fqsr_a2',   -- %17
-    model||'_qm_fqsr_a2w',  -- %18
-    model||'_qm_fqsr_a3',   -- %19
-    model||'_qm_fqsr_a3w',  -- %20
-    model||'_qm_fmsr_a1',   -- %21
-    model||'_qm_fmsr_a2',   -- %22
-    model||'_qm_fmsr_a2w',  -- %23
-    model||'_qm_fmsr_a3',   -- %24
-    model||'_qm_fmsr_a3w'   -- %25
+    model||'_qm',          -- %2  <model>_qm
+    model||'_qm_yqm',      -- %3
+    model||'_qm_smv',      -- %4
+    model||'_qm_qsr',      -- %5
+    model||'_qm_msr',      -- %6
+    model||'_qm_p1_k',     -- %7
+    model||'_qm_p1_qsr',   -- %8
+    model||'_qm_p1_msr',   -- %9
+    model||'_qm_p2_k',     -- %10
+    model||'_qm_p2_qsr',   -- %11
+    model||'_qm_p2_msr',   -- %12
+    model||'_qm_p3_k',     -- %13
+    model||'_qm_p3_qsr',   -- %14
+    model||'_qm_p3_msr',   -- %15
+    model||'_qm_fqsr_a1',  -- %16
+    model||'_qm_fqsr_a2',  -- %17
+    model||'_qm_fqsr_a2w', -- %18
+    model||'_qm_fqsr_a3',  -- %19
+    model||'_qm_fqsr_a3w', -- %20
+    model||'_qm_fmsr_a1',  -- %21
+    model||'_qm_fmsr_a2',  -- %22
+    model||'_qm_fmsr_a2w', -- %23
+    model||'_qm_fmsr_a3',  -- %24
+    model||'_qm_fmsr_a3w', -- %25
+    model||'_qm_fqsr_a0',  -- %26
+    model||'_qm_fmsr_a0'   -- %27
   );
 
   EXECUTE format('GRANT SELECT, INSERT, UPDATE ON engine.%I TO PUBLIC;', qm_tbl);
