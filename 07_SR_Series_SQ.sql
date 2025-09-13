@@ -1,4 +1,6 @@
 -- REPLACE: engine.build_sr_series_sq(uuid)
+-- VC 1.1 (2025-09-12): PASS 2 optimized with set-based DISTINCT ON update; covering index
+--                      (forecast_id, <model>_yqm, date) INCLUDE (<model>_qsr, <model>_msr); ANALYZE before update.
 BEGIN;
 CREATE OR REPLACE FUNCTION engine.build_sr_series_sq(p_forecast_id uuid DEFAULT NULL)
 RETURNS void
@@ -8,6 +10,7 @@ DECLARE
   fid     uuid;
   mdl     record;
   out_tbl text;
+  run_legacy_pass2 boolean := false;
 BEGIN
   IF p_forecast_id IS NULL THEN
     SELECT ih.forecast_id INTO fid
@@ -100,31 +103,115 @@ BEGIN
       mdl.model                      -- %11
     );
 
-    -- PASS 2 + PASS 3 stay the same as your current function
+    EXECUTE format(
+      'CREATE INDEX IF NOT EXISTS %I ON engine.%I (%I, %I, date) INCLUDE (%I, %I)',
+      'ix_'||mdl.model||'_sr_sq_fid_yqm_date',
+      out_tbl,
+      'forecast_id', mdl.model||'_yqm', mdl.model||'_qsr', mdl.model||'_msr'
+    );
+    EXECUTE format('ANALYZE engine.%I', out_tbl);
+
+    -- PASS 2 legacy (kept, disabled)
+    IF run_legacy_pass2 THEN
+      EXECUTE format($q$
+        UPDATE engine.%1$I AS t
+        SET
+          %2$I = (SELECT p.%6$I FROM engine.%1$I p
+                  WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%5$I AND p.date<t.date
+                  ORDER BY p.date DESC LIMIT 1),
+          %3$I = (SELECT p.%7$I FROM engine.%1$I p
+                  WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%5$I AND p.date<t.date
+                  ORDER BY p.date DESC LIMIT 1),
+
+          %8$I = (SELECT p.%6$I FROM engine.%1$I p
+                  WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%9$I AND p.date<t.date
+                  ORDER BY p.date DESC LIMIT 1),
+          %10$I= (SELECT p.%7$I FROM engine.%1$I p
+                  WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%9$I AND p.date<t.date
+                  ORDER BY p.date DESC LIMIT 1),
+
+          %11$I= (SELECT p.%6$I FROM engine.%1$I p
+                  WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%12$I AND p.date<t.date
+                  ORDER BY p.date DESC LIMIT 1),
+          %13$I= (SELECT p.%7$I FROM engine.%1$I p
+                  WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%12$I AND p.date<t.date
+                  ORDER BY p.date DESC LIMIT 1)
+        WHERE t.forecast_id = %14$L;
+      $q$,
+        out_tbl,
+        mdl.model||'_q_p1_qsr', mdl.model||'_q_p1_msr',
+        mdl.model||'_yqm',      mdl.model||'_q_p1_k',
+        mdl.model||'_qsr',      mdl.model||'_msr',
+        mdl.model||'_q_p2_qsr', mdl.model||'_q_p2_k', mdl.model||'_q_p2_msr',
+        mdl.model||'_q_p3_qsr', mdl.model||'_q_p3_k', mdl.model||'_q_p3_msr',
+        fid
+      );
+    END IF;
+
+    -- PASS 2B optimized
     EXECUTE format($q$
-      UPDATE engine.%1$I AS t
-      SET
-        %2$I = (SELECT p.%6$I FROM engine.%1$I p
-                WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%5$I AND p.date<t.date
-                ORDER BY p.date DESC LIMIT 1),
-        %3$I = (SELECT p.%7$I FROM engine.%1$I p
-                WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%5$I AND p.date<t.date
-                ORDER BY p.date DESC LIMIT 1),
-
-        %8$I = (SELECT p.%6$I FROM engine.%1$I p
-                WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%9$I AND p.date<t.date
-                ORDER BY p.date DESC LIMIT 1),
-        %10$I= (SELECT p.%7$I FROM engine.%1$I p
-                WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%9$I AND p.date<t.date
-                ORDER BY p.date DESC LIMIT 1),
-
-        %11$I= (SELECT p.%6$I FROM engine.%1$I p
-                WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%12$I AND p.date<t.date
-                ORDER BY p.date DESC LIMIT 1),
-        %13$I= (SELECT p.%7$I FROM engine.%1$I p
-                WHERE p.forecast_id=t.forecast_id AND p.%4$I=t.%12$I AND p.date<t.date
-                ORDER BY p.date DESC LIMIT 1)
-      WHERE t.forecast_id = %14$L;
+      WITH
+      p1 AS (
+        SELECT DISTINCT ON (t.forecast_id, t.date)
+               t.forecast_id, t.date, s.%6$I AS qsr, s.%7$I AS msr
+        FROM engine.%1$I t
+        JOIN engine.%1$I s
+          ON s.forecast_id = t.forecast_id
+         AND s.%4$I        = t.%5$I
+         AND s.date        < t.date
+        WHERE t.forecast_id = %14$L
+        ORDER BY t.forecast_id, t.date, s.date DESC
+      ),
+      p2 AS (
+        SELECT DISTINCT ON (t.forecast_id, t.date)
+               t.forecast_id, t.date, s.%6$I AS qsr, s.%7$I AS msr
+        FROM engine.%1$I t
+        JOIN engine.%1$I s
+          ON s.forecast_id = t.forecast_id
+         AND s.%4$I        = t.%9$I
+         AND s.date        < t.date
+        WHERE t.forecast_id = %14$L
+        ORDER BY t.forecast_id, t.date, s.date DESC
+      ),
+      p3 AS (
+        SELECT DISTINCT ON (t.forecast_id, t.date)
+               t.forecast_id, t.date, s.%6$I AS qsr, s.%7$I AS msr
+        FROM engine.%1$I t
+        JOIN engine.%1$I s
+          ON s.forecast_id = t.forecast_id
+         AND s.%4$I        = t.%12$I
+         AND s.date        < t.date
+        WHERE t.forecast_id = %14$L
+        ORDER BY t.forecast_id, t.date, s.date DESC
+      ),
+      keys AS (
+        SELECT forecast_id, date FROM p1
+        UNION
+        SELECT forecast_id, date FROM p2
+        UNION
+        SELECT forecast_id, date FROM p3
+      ),
+      allp AS (
+        SELECT k.forecast_id, k.date,
+               p1.qsr AS p1_qsr, p1.msr AS p1_msr,
+               p2.qsr AS p2_qsr, p2.msr AS p2_msr,
+               p3.qsr AS p3_qsr, p3.msr AS p3_msr
+        FROM keys k
+        LEFT JOIN p1 ON p1.forecast_id=k.forecast_id AND p1.date=k.date
+        LEFT JOIN p2 ON p2.forecast_id=k.forecast_id AND p2.date=k.date
+        LEFT JOIN p3 ON p3.forecast_id=k.forecast_id AND p3.date=k.date
+      )
+      UPDATE engine.%1$I t
+         SET %2$I  = allp.p1_qsr,
+             %3$I  = allp.p1_msr,
+             %8$I  = allp.p2_qsr,
+             %10$I = allp.p2_msr,
+             %11$I = allp.p3_qsr,
+             %13$I = allp.p3_msr
+      FROM allp
+      WHERE t.forecast_id = allp.forecast_id
+        AND t.date        = allp.date
+        AND t.forecast_id = %14$L;
     $q$,
       out_tbl,
       mdl.model||'_q_p1_qsr', mdl.model||'_q_p1_msr',
@@ -135,6 +222,7 @@ BEGIN
       fid
     );
 
+    -- PASS 3: blends (unchanged)
     EXECUTE format($q$
       UPDATE engine.%2$I t
       SET

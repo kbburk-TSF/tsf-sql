@@ -12,3 +12,8 @@ IMPORT FOREIGN SCHEMA seasonal_matrix
 LIMIT TO (wd_md)
 FROM SERVER seasonal_matrix_srv
 INTO engine;
+
+IMPORT FOREIGN SCHEMA seasonal_matrix
+LIMIT TO (mo_sf)
+FROM SERVER seasonal_matrix_srv
+INTO engine;
