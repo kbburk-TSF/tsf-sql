@@ -1,16 +1,53 @@
 -- =====================================================================
+-- FILE: 03_HistoricalInstanceTable.sql
+-- PURPOSE: Build/refresh engine.instance_historical for a single forecast_id
+--          PASS 1: hydrate from staging (no calculations)
+--          PASS 2: compute qmv/mmv and LQM/LMM fields
+-- OUTPUT: engine.instance_historical
+-- =====================================================================
 -- Version: 2025-09-11  v2.1
 -- Change: Convert 01_HistoricalInstanceTable.sql into TWO-PASS function:
 --   PASS 1 = hydrate raw rows from staging; PASS 2 = compute qmv/mmv & LQM/LMM.
 --   No date generation. Preserves created_at. Writes to engine.instance_historical.
+-- =====================================================================
+-- Version: 2025-09-13  v2.4
+-- Change: OPT ONLY — added session tuning (set_config), progress notices with timings,
+--         and ANALYZE after PASS 1 and PASS 2. ***No calculation or logic changes.***
 -- =====================================================================
 
 CREATE OR REPLACE FUNCTION engine.build_instance_historical(p_forecast_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  _t_start timestamptz := clock_timestamp();
+  _t_pass  timestamptz;
+  _rows    bigint;
 BEGIN
+  -- Session tuning (best-effort; ignored if not permitted)
+  BEGIN
+    PERFORM set_config('client_min_messages','NOTICE',true);
+    PERFORM set_config('jit','off',true);
+    PERFORM set_config('work_mem','256MB',true);
+    PERFORM set_config('maintenance_work_mem','512MB',true);
+    PERFORM set_config('max_parallel_workers_per_gather','4',true);
+    PERFORM set_config('parallel_setup_cost','0',true);
+    PERFORM set_config('parallel_tuple_cost','0',true);
+    PERFORM set_config('synchronous_commit','off',true);
+    PERFORM set_config('temp_buffers','64MB',true);
+  EXCEPTION WHEN OTHERS THEN
+    -- ignore if the host disallows changing any of these
+    NULL;
+  END;
+
+  IF p_forecast_id IS NULL THEN
+    RAISE EXCEPTION 'build_instance_historical requires p_forecast_id';
+  END IF;
+
   /* ---------------- PASS 1: HYDRATE RAW ROWS (from CSV-loaded staging) ---------------- */
+  _t_pass := clock_timestamp();
+  RAISE NOTICE '[%] PASS 1 — hydrate engine.instance_historical', _t_pass;
+
   INSERT INTO engine.instance_historical (
     forecast_id, "date", value, qmv, mmv,
     lqm1, lqm5, lqm10, lqm15, lqm30,
@@ -39,7 +76,14 @@ BEGIN
     lmm1 = NULL, lmm5 = NULL, lmm10 = NULL, lmm15 = NULL, lmm30 = NULL,
     created_at = COALESCE(engine.instance_historical.created_at, EXCLUDED.created_at);
 
+  GET DIAGNOSTICS _rows = ROW_COUNT;
+  RAISE NOTICE '[%] PASS 1 complete — affected rows: %; ANALYZE', clock_timestamp(), _rows;
+  ANALYZE engine.instance_historical;
+
   /* ---------------- PASS 2: COMPUTE qmv/mmv (look-forward) & LQM/LMM (look-back) ---------------- */
+  _t_pass := clock_timestamp();
+  RAISE NOTICE '[%] PASS 2 — compute qmv/mmv and LQM/LMM', _t_pass;
+
   WITH rows AS (
     SELECT
       ih.forecast_id,
@@ -145,5 +189,12 @@ BEGIN
   WHERE ih.forecast_id = p_forecast_id
     AND ih."date" = c.d;
 
+  GET DIAGNOSTICS _rows = ROW_COUNT;
+  RAISE NOTICE '[%] PASS 2 complete — updated rows: %; ANALYZE', clock_timestamp(), _rows;
+  ANALYZE engine.instance_historical;
+
+  RAISE NOTICE '[%] DONE build_instance_historical (elapsed %.3f s)',
+               clock_timestamp(),
+               EXTRACT(epoch FROM clock_timestamp() - _t_start);
 END;
 $$;

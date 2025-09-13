@@ -4,6 +4,8 @@
 -- REPLACE: engine.build_sr_series_s(uuid)
 -- VC 1.1 (2025-09-12): PASS 2 optimized with set-based DISTINCT ON update; adds covering index
 --                      (forecast_id, <model>_yqm, date) INCLUDE (<model>_qsr, <model>_msr); ANALYZE before update.
+-- VC 2.0 (2025-09-13): OPT — session tuning, progress notices & timings, ANALYZE after PASS 2B and PASS 3 (logic unchanged).
+
 BEGIN;
 CREATE OR REPLACE FUNCTION engine.build_sr_series_s(p_forecast_id uuid DEFAULT NULL)
 RETURNS void
@@ -14,7 +16,29 @@ DECLARE
   mdl     record;
   out_tbl text;
   run_legacy_pass2 boolean := false; -- keep old PASS 2 for reference; do not execute
+
+  -- added for notices/timings
+  _t_start timestamptz := clock_timestamp();
+  _t_pass  timestamptz;
+  _rows    bigint;
 BEGIN
+  -- Session tuning (best-effort; ignored if not permitted)
+  BEGIN
+    PERFORM set_config('client_min_messages','NOTICE',true);
+    PERFORM set_config('jit','off',true);
+    PERFORM set_config('work_mem','256MB',true);
+    PERFORM set_config('maintenance_work_mem','512MB',true);
+    PERFORM set_config('max_parallel_workers_per_gather','4',true);
+    PERFORM set_config('parallel_setup_cost','0',true);
+    PERFORM set_config('parallel_tuple_cost','0',true);
+    PERFORM set_config('synchronous_commit','off',true);
+    PERFORM set_config('temp_buffers','64MB',true);
+  EXCEPTION WHEN OTHERS THEN
+    -- ignore: not all settings are allowed on all hosts
+  END;
+
+  RAISE NOTICE '[%] build_sr_series_s — start', clock_timestamp();
+
   IF p_forecast_id IS NULL THEN
     SELECT ih.forecast_id INTO fid
     FROM engine.instance_historical ih
@@ -27,6 +51,8 @@ BEGIN
   IF fid IS NULL THEN
     RAISE EXCEPTION 'No forecast_id found in engine.instance_historical.';
   END IF;
+
+  RAISE NOTICE '[%] forecast_id = %', clock_timestamp(), fid;
 
   FOR mdl IN
     SELECT c.relname AS model
@@ -49,6 +75,8 @@ BEGIN
   LOOP
     out_tbl := mdl.model || '_instance_sr_s';
 
+    RAISE NOTICE '[%] SERIES % — target table engine.%', clock_timestamp(), mdl.model, out_tbl;
+
     IF NOT EXISTS (
       SELECT 1 FROM information_schema.tables
       WHERE table_schema='engine' AND table_name=out_tbl
@@ -57,6 +85,9 @@ BEGIN
     END IF;
 
     -- PASS 1: base insert with UPSERT (idempotent)
+    _t_pass := clock_timestamp();
+    RAISE NOTICE '[%] PASS 1 — insert/upsert into engine.%', _t_pass, out_tbl;
+
     EXECUTE format($q$
       INSERT INTO engine.%1$I (
         forecast_id, date, value, qmv, mmv,
@@ -105,6 +136,9 @@ BEGIN
       fid,                           -- %10
       mdl.model                      -- %11
     );
+    GET DIAGNOSTICS _rows = ROW_COUNT;
+    RAISE NOTICE '[%] PASS 1 done — rows affected: %, elapsed: %.3f s',
+      clock_timestamp(), _rows, EXTRACT(epoch FROM clock_timestamp() - _t_pass);
 
     -- Covering index to accelerate PASS 2B lookbacks
     EXECUTE format(
@@ -119,6 +153,9 @@ BEGIN
 
     -- PASS 2 (legacy; preserved, disabled)
     IF run_legacy_pass2 THEN
+      _t_pass := clock_timestamp();
+      RAISE NOTICE '[%] PASS 2 (legacy) — engine.%', _t_pass, out_tbl;
+
       EXECUTE format($q$
         UPDATE engine.%1$I AS t
         SET
@@ -152,9 +189,16 @@ BEGIN
         mdl.model||'_p3_qsr', mdl.model||'_p3_k', mdl.model||'_p3_msr',
         fid
       );
+
+      GET DIAGNOSTICS _rows = ROW_COUNT;
+      RAISE NOTICE '[%] PASS 2 (legacy) done — rows updated: %, elapsed: %.3f s',
+        clock_timestamp(), _rows, EXTRACT(epoch FROM clock_timestamp() - _t_pass);
     END IF;
 
     -- PASS 2B (optimized): single set-based update using DISTINCT ON per (forecast_id,date)
+    _t_pass := clock_timestamp();
+    RAISE NOTICE '[%] PASS 2B — lookbacks via DISTINCT ON — engine.%', _t_pass, out_tbl;
+
     EXECUTE format($q$
       WITH
       p1 AS (
@@ -230,8 +274,17 @@ BEGIN
       mdl.model||'_p3_qsr', mdl.model||'_p3_k', mdl.model||'_p3_msr',
       fid
     );
+    GET DIAGNOSTICS _rows = ROW_COUNT;
+    RAISE NOTICE '[%] PASS 2B done — rows updated: %, elapsed: %.3f s',
+      clock_timestamp(), _rows, EXTRACT(epoch FROM clock_timestamp() - _t_pass);
+
+    -- ANALYZE after PASS 2B (added)
+    EXECUTE format('ANALYZE engine.%I', out_tbl);
 
     -- PASS 3: blends (unchanged)
+    _t_pass := clock_timestamp();
+    RAISE NOTICE '[%] PASS 3 — blends — engine.%', _t_pass, out_tbl;
+
     EXECUTE format($q$
       UPDATE engine.%2$I t
       SET
@@ -248,7 +301,17 @@ BEGIN
         %1$s_fmsr_a3w = ((%1$s_p1_msr * 0.5) + (%1$s_p2_msr * 0.3) + (%1$s_p3_msr * 0.2))
       WHERE t.forecast_id = %3$L;
     $q$, mdl.model, out_tbl, fid);
+    GET DIAGNOSTICS _rows = ROW_COUNT;
+    RAISE NOTICE '[%] PASS 3 done — rows updated: %, elapsed: %.3f s',
+      clock_timestamp(), _rows, EXTRACT(epoch FROM clock_timestamp() - _t_pass);
+
+    -- ANALYZE after PASS 3 (added)
+    EXECUTE format('ANALYZE engine.%I', out_tbl);
+
+    RAISE NOTICE '[%] SERIES % — complete', clock_timestamp(), mdl.model;
   END LOOP;
+
+  RAISE NOTICE '[%] build_sr_series_s — done (elapsed %.3f s)', clock_timestamp(), EXTRACT(epoch FROM clock_timestamp() - _t_start);
 END;
 $$;
 COMMIT;
