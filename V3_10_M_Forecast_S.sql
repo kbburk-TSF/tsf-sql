@@ -1,6 +1,6 @@
 -- DEV BUILD v2025-09-13: S-series — build 48-variant forecast tables for EVERY date per SR table
  
-CREATE OR REPLACE FUNCTION engine.build_forecast_ms_sq()
+CREATE OR REPLACE FUNCTION engine.build_forecast_ms_s()
 RETURNS void
 AS $$
 
@@ -97,7 +97,7 @@ BEGIN
     t_series_start := clock_timestamp();
 
     sr_rel  := r.tablename;
-    base    := regexp_replace(sr_rel, '_instance_sr_sq$', '');
+    base    := regexp_replace(sr_rel, '_instance_sr_s$', '');
     sr_qual := format('%I.%I', 'engine', sr_rel);
 
     RAISE NOTICE '[%] BEGIN series % — scanning latest forecast_id', clock_timestamp(), base;
@@ -121,7 +121,7 @@ BEGIN
       RAISE NOTICE '[%] SKIP series % — no historical', clock_timestamp(), base;
       CONTINUE;
     END IF;
-    dest_rel  := base || '_instance_forecast_msq';
+    dest_rel  := base || '_instance_forecast_ms';
     dest_qual := format('%I.%I', 'engine', dest_rel);
     IF to_regclass(dest_qual) IS NULL THEN RAISE EXCEPTION 'destination missing: %', dest_qual; END IF;
     -- Determine destination column names (prefer 'series'/'season'; fallback to legacy)
@@ -133,13 +133,13 @@ BEGIN
     IF NOT FOUND THEN dest_season_col := base || '_yqm'; END IF;
 
 
-    sr_base_col       := 'sr.' || quote_ident(base || '_q');
+    sr_base_col       := 'sr.' || quote_ident(base);
     sr_yqm_col        := 'sr.' || quote_ident(base || '_yqm');
-    sr_fmsr_a1_col    := 'sr.' || quote_ident(base || '_q_fmsr_a1');
-    sr_fmsr_a2_col    := 'sr.' || quote_ident(base || '_q_fmsr_a2');
-    sr_fmsr_a2w_col   := 'sr.' || quote_ident(base || '_q_fmsr_a2w');
-    sr_fmsr_a3_col    := 'sr.' || quote_ident(base || '_q_fmsr_a3');
-    sr_fmsr_a3w_col   := 'sr.' || quote_ident(base || '_q_fmsr_a3w');
+    sr_fmsr_a1_col    := 'sr.' || quote_ident(base || '_fmsr_a1');
+    sr_fmsr_a2_col    := 'sr.' || quote_ident(base || '_fmsr_a2');
+    sr_fmsr_a2w_col   := 'sr.' || quote_ident(base || '_fmsr_a2w');
+    sr_fmsr_a3_col    := 'sr.' || quote_ident(base || '_fmsr_a3');
+    sr_fmsr_a3w_col   := 'sr.' || quote_ident(base || '_fmsr_a3w');
 
     ------------------------------------------------------------------
     -- PASS 1 — CTAS
@@ -251,7 +251,7 @@ $f$,
       sr_qual, latest_id
     );
     EXECUTE sql;
-    -- keep dest_rel/dest_qual for _instance_forecast_msq
+    -- keep dest_rel/dest_qual for _instance_forecast_ms
 EXECUTE format($i$
       INSERT INTO %1$s (
         forecast_id, "date", value, %2$I, %3$I, model_name, base_model, base_fv,
