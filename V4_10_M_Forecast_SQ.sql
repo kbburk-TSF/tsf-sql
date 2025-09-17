@@ -1,3 +1,13 @@
+-- V4_10_M_Forecast_SQ.sql
+-- Milestone 2: preserve original M-forecast SQ-series logic and add wrapper to create destination tables if missing.
+-- VC V4.0 (2025-09-17):
+--   * Original function engine.build_forecast_ms_sq() kept verbatim below (no math/logic changes).
+--   * New wrapper engine.build_forecast_ms_sq(p_run_id uuid DEFAULT NULL) ensures:
+--       - Compatibility view binom.binom_p -> engine.binom_p (no FDW required)
+--       - Destination tables engine.<base>_instance_forecast_msq exist (standard column set)
+--     Then calls the original function to perform the full build.
+--   * Grants aligned to matrix_reader and tsf_engine_app.
+
 -- DEV BUILD v2025-09-13: S-series — build 48-variant forecast tables for EVERY date per SR table
  
 CREATE OR REPLACE FUNCTION engine.build_forecast_ms_sq()
@@ -705,3 +715,94 @@ EXECUTE format($i$
     EXTRACT(epoch FROM clock_timestamp() - t_run_start);
 END
 $$ LANGUAGE plpgsql;
+
+
+-- ===================== PIPELINE WRAPPER (no math changes) =====================
+CREATE OR REPLACE FUNCTION engine.build_forecast_ms_sq(
+  p_run_id uuid DEFAULT NULL  -- reserved for symmetry; not used inside the original function
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+AS $$
+DECLARE
+  r record;
+  base text;
+  dest_rel text;
+  dest_qual text;
+  ddl text;
+BEGIN
+  -- Ensure compatibility view for binomial lookup (original function expects binom.binom_p)
+  PERFORM 1 FROM pg_namespace WHERE nspname = 'binom';
+  IF NOT FOUND THEN
+    EXECUTE 'CREATE SCHEMA binom';
+  END IF;
+  IF to_regclass('binom.binom_p') IS NULL THEN
+    EXECUTE 'CREATE OR REPLACE VIEW binom.binom_p AS SELECT * FROM engine.binom_p';
+    GRANT USAGE ON SCHEMA binom TO matrix_reader, tsf_engine_app;
+    GRANT SELECT ON binom.binom_p TO matrix_reader, tsf_engine_app;
+  END IF;
+
+  -- Create missing destination tables for each SQ-series SR output
+  FOR r IN
+    SELECT tablename
+    FROM pg_catalog.pg_tables
+    WHERE schemaname = 'engine'
+      AND tablename LIKE '%\_instance\_sr\_sq' ESCAPE '\'
+    ORDER BY tablename
+  LOOP
+    base := regexp_replace(r.tablename, '_instance_sr_sq$', '');
+    dest_rel  := base || '_instance_forecast_msq';
+    dest_qual := format('%I.%I', 'engine', dest_rel);
+
+    IF to_regclass(dest_qual) IS NULL THEN
+      ddl := format($ct$
+        CREATE TABLE engine.%I (
+          forecast_id uuid NOT NULL,
+          date        date NOT NULL,
+          value       numeric(18,4),
+          series      text,
+          season      text,
+          model_name  text,
+          base_model  text,
+          base_fv     numeric(18,4),
+          fmsr_series text,
+          fmsr_value  numeric(18,4),
+          fv          numeric,
+          fv_error    numeric,
+          fv_mae      numeric,
+          fv_mean_mae numeric,
+          fv_mean_mae_c numeric,
+          fv_u        numeric,
+          fv_l        numeric,
+          mae_comparison      text,
+          mean_mae_comparison text,
+          accuracy_comparison text,
+          best_fm_count    numeric,
+          best_fm_odds     numeric,
+          best_fm_sig      numeric,
+          fv_interval      text,
+          fv_interval_c    numeric,
+          fv_interval_odds numeric,
+          fv_interval_sig  numeric,
+          fv_variance      numeric,
+          fv_variance_mean numeric,
+          created_at timestamptz DEFAULT now(),
+          PRIMARY KEY (forecast_id, date)
+        );
+      $ct$, dest_rel);
+      EXECUTE ddl;
+
+      -- Visibility & app access
+      EXECUTE format('GRANT SELECT ON engine.%I TO matrix_reader', dest_rel);
+      EXECUTE format('GRANT SELECT, INSERT, UPDATE ON engine.%I TO tsf_engine_app', dest_rel);
+    END IF;
+  END LOOP;
+
+  -- Call the original function to perform the actual build
+  PERFORM engine.build_forecast_ms_sq();
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION engine.build_forecast_ms_sq() TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_forecast_ms_sq(uuid) TO matrix_reader, tsf_engine_app;

@@ -1,3 +1,12 @@
+-- V4_02_Binomial_Lookup_Local.sql
+-- Local binomial p-value lookup (engine.binom_p), no FDW.
+-- VC V4.0 (2025-09-17): Migrated from BINOMIAL_LOOKUP_SEASONAL_MODEL_DB.sql unchanged except for schema = engine.
+--                   Drops & recreates engine.binom_p and repopulates via recurrence at p=0.5.
+--                   Grants SELECT to matrix_reader and tsf_engine_app.
+
+-- Ensure target schema exists (idempotent)
+CREATE SCHEMA IF NOT EXISTS engine;
+
 -- Binomial p-value lookup (two-sided, p = 0.5) in PUBLIC schema
 -- VC 2.3 (public): rebuild table; p_two_sided stored as numeric(12,4);
 --                  values that would round to 0.0000 are stored as 0.0001;
@@ -14,9 +23,9 @@ DECLARE
   i     int;
 BEGIN
   -- Recreate lookup table with fixed 4-decimal scale
-  DROP TABLE IF EXISTS public.binom_p;
+  DROP TABLE IF EXISTS engine.binom_p;
 
-  CREATE TABLE public.binom_p (
+  CREATE TABLE engine.binom_p (
     n            int NOT NULL,
     k            int NOT NULL,
     p_two_sided  numeric(12,4) NOT NULL,
@@ -52,7 +61,7 @@ BEGIN
 
     -- two-sided p(k; n, 0.5) = 2 * lower_tail(min(k, n-k)); cap at 1
     -- store as numeric(12,4); if it would round to 0.0000, store 0.0001 instead
-    INSERT INTO public.binom_p (n, k, p_two_sided)
+    INSERT INTO engine.binom_p (n, k, p_two_sided)
     SELECT
       nn AS n,
       k.k,
@@ -68,9 +77,12 @@ BEGIN
     DROP TABLE IF EXISTS __cs;
   END LOOP;
 
-  ANALYZE public.binom_p;
+  ANALYZE engine.binom_p;
 
   -- Make it readable by FDW/TablePlus users without extra grants
-  GRANT SELECT ON public.binom_p TO PUBLIC;
+  GRANT SELECT ON engine.binom_p TO PUBLIC;
 END
 $$ LANGUAGE plpgsql;
+
+-- Visibility & access
+GRANT SELECT ON TABLE engine.binom_p TO matrix_reader, tsf_engine_app;

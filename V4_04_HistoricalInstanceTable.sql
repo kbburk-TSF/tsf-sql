@@ -1,3 +1,17 @@
+-- V4_04_HistoricalInstanceTable.sql
+-- Milestone 2: preserve original math/logic verbatim, add pipeline wrapper.
+-- VC V4.0 (2025-09-17): 
+--   - Keep existing engine.build_instance_historical(p_forecast_id uuid) EXACTLY as-is (copied below).
+--   - Add engine.build_instance_historical(p_forecast_id uuid, p_run_id uuid DEFAULT NULL) wrapper:
+--       * advisory lock to prevent duplicate runs per forecast_id
+--       * optional audit writes to engine.instance_runs when p_run_id provided
+--       * calls the original single-arg function to do the work
+--       * updates forecast_registry to 'historical_ready' on success
+--   - Grants EXECUTE to matrix_reader and tsf_engine_app on BOTH signatures.
+-- Notes:
+--   * No changes to math or logic inside the original function.
+--   * Orchestrator should call the 2-arg wrapper to get auditing; legacy paths may keep using the 1-arg function.
+
 -- V3_03_HistoricalInstanceTable.sql
 -- =====================================================================
 -- Version: 2025-09-15  v3.0
@@ -162,3 +176,58 @@ BEGIN
 
 END;
 $$;
+
+
+-- ===================== PIPELINE WRAPPER (no math inside) =====================
+CREATE OR REPLACE FUNCTION engine.build_instance_historical(
+  p_forecast_id uuid,
+  p_run_id uuid DEFAULT NULL
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+AS $$
+DECLARE
+  _rowcount bigint;
+BEGIN
+  -- Prevent concurrent builds for the same forecast_id within this transaction
+  IF NOT pg_try_advisory_xact_lock(6804, hashtext(p_forecast_id::text)) THEN
+    RAISE EXCEPTION 'Historical build already running for %', p_forecast_id USING ERRCODE = '55P03';
+  END IF;
+
+  -- Audit start (optional)
+  IF p_run_id IS NOT NULL THEN
+    INSERT INTO engine.instance_runs(run_id, forecast_id, phase, model, series, status, started_at)
+    VALUES (p_run_id, p_forecast_id, 'historical', NULL, NULL, 'running', now())
+    ON CONFLICT (run_id) DO UPDATE
+      SET status='running', started_at=now(), error_text=NULL;
+  END IF;
+
+  -- Call the original 1-arg function (contains ALL the math/logic)
+  PERFORM engine.build_instance_historical(p_forecast_id);
+
+  -- Audit success
+  IF p_run_id IS NOT NULL THEN
+    UPDATE engine.instance_runs
+      SET status='succeeded',
+          finished_at=now(),
+          rowcount = (SELECT COUNT(*) FROM engine.instance_historical WHERE forecast_id = p_forecast_id)
+    WHERE run_id = p_run_id;
+  END IF;
+
+  -- Registry state advance for orchestrator
+  PERFORM engine.registry_touch(p_forecast_id, 'historical_ready', NULL);
+
+EXCEPTION WHEN OTHERS THEN
+  IF p_run_id IS NOT NULL THEN
+    UPDATE engine.instance_runs
+      SET status='failed', finished_at=now(), error_text = SQLERRM
+    WHERE run_id = p_run_id;
+  END IF;
+  RAISE;
+END;
+$$;
+
+-- Execution privileges
+GRANT EXECUTE ON FUNCTION engine.build_instance_historical(uuid) TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_instance_historical(uuid, uuid) TO matrix_reader, tsf_engine_app;
