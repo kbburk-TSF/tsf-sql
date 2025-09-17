@@ -187,9 +187,24 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  -- 1) Ensure a registry row exists and flip status to 'staged' for each forecast_id in this batch
   PERFORM engine.registry_touch(n.forecast_id, 'staged', NULL)
-  FROM new_batch AS n
-  WHERE n.forecast_id IS NOT NULL;
+  FROM (SELECT DISTINCT forecast_id FROM new_batch WHERE forecast_id IS NOT NULL) AS n;
+
+  -- 2) If the CSV carried a forecast_name, copy it into registry.forecast_name AND source_csv_filename
+  --    (do not overwrite existing values with NULLs)
+  UPDATE engine.forecast_registry r
+  SET forecast_name       = COALESCE(s.forecast_name, r.forecast_name),
+      source_csv_filename = COALESCE(s.forecast_name, r.source_csv_filename),
+      updated_at          = now()
+  FROM (
+    SELECT forecast_id, MAX(forecast_name) AS forecast_name
+    FROM new_batch
+    WHERE forecast_name IS NOT NULL
+    GROUP BY forecast_id
+  ) AS s
+  WHERE r.forecast_id = s.forecast_id;
+
   RETURN NULL;
 END;
 $$;
