@@ -187,23 +187,26 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  -- 1) Ensure a registry row exists and flip status to 'staged' for each forecast_id in this batch
-  PERFORM engine.registry_touch(n.forecast_id, 'staged', NULL)
-  FROM (SELECT DISTINCT forecast_id FROM new_batch WHERE forecast_id IS NOT NULL) AS n;
-
-  -- 2) If the CSV carried a forecast_name, copy it into registry.forecast_name AND source_csv_filename
-  --    (do not overwrite existing values with NULLs)
-  UPDATE engine.forecast_registry r
-  SET forecast_name       = COALESCE(s.forecast_name, r.forecast_name),
-      source_csv_filename = COALESCE(s.forecast_name, r.source_csv_filename),
-      updated_at          = now()
-  FROM (
-    SELECT forecast_id, MAX(forecast_name) AS forecast_name
-    FROM new_batch
-    WHERE forecast_name IS NOT NULL
-    GROUP BY forecast_id
-  ) AS s
-  WHERE r.forecast_id = s.forecast_id;
+  -- Upsert one registry row per forecast_id present in this batch,
+  -- pulling forecast_name (CSV filename) from the staging rows when available.
+  INSERT INTO engine.forecast_registry (
+      forecast_id, forecast_name, source_csv_filename, status, created_at, updated_at
+  )
+  SELECT
+      nb.forecast_id,
+      -- require a non-null name; if multiple rows differ, pick any non-null (MAX) from the batch
+      MAX(nb.forecast_name) AS forecast_name,
+      MAX(nb.forecast_name) AS source_csv_filename,
+      'staged'::text,
+      now(), now()
+  FROM new_batch nb
+  WHERE nb.forecast_id IS NOT NULL
+  GROUP BY nb.forecast_id
+  ON CONFLICT (forecast_id) DO UPDATE
+    SET status               = 'staged',
+        forecast_name        = COALESCE(EXCLUDED.forecast_name, engine.forecast_registry.forecast_name),
+        source_csv_filename  = COALESCE(EXCLUDED.source_csv_filename, engine.forecast_registry.source_csv_filename),
+        updated_at           = now();
 
   RETURN NULL;
 END;
