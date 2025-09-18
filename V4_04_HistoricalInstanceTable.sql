@@ -1,16 +1,18 @@
 -- V4_04_HistoricalInstanceTable.sql
--- Milestone 2: preserve original math/logic verbatim, add pipeline wrapper.
--- VC V4.0 (2025-09-17): 
---   - Keep existing engine.build_instance_historical(p_forecast_id uuid) EXACTLY as-is (copied below).
---   - Add engine.build_instance_historical(p_forecast_id uuid, p_run_id uuid DEFAULT NULL) wrapper:
---       * advisory lock to prevent duplicate runs per forecast_id
---       * optional audit writes to engine.instance_runs when p_run_id provided
---       * calls the original single-arg function to do the work
---       * updates forecast_registry to 'historical_ready' on success
---   - Grants EXECUTE to matrix_reader and tsf_engine_app on BOTH signatures.
--- Notes:
---   * No changes to math or logic inside the original function.
---   * Orchestrator should call the 2-arg wrapper to get auditing; legacy paths may keep using the 1-arg function.
+-- Historical instance builder — ambiguity-free:
+--   * Original math moved to engine.build_instance_historical_core(uuid) (verbatim body)
+--   * Zero-arg wrapper engine.build_instance_historical() auto-picks newest forecast_id
+--   * Audit wrapper engine.build_instance_historical_run(uuid, uuid) for future orchestration
+-- VC V4.0 (2025-09-17)
+
+BEGIN;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Remove any older ambiguous overloads
+DROP FUNCTION IF EXISTS engine.build_instance_historical() CASCADE;
+DROP FUNCTION IF EXISTS engine.build_instance_historical(uuid) CASCADE;
+DROP FUNCTION IF EXISTS engine.build_instance_historical(uuid, uuid) CASCADE;
 
 -- V3_03_HistoricalInstanceTable.sql
 -- =====================================================================
@@ -20,7 +22,7 @@
 --   - No permissions created/changed here (assumed set by V3_00_Create_Engine_Schema.sql).
 -- =====================================================================
 
-CREATE OR REPLACE FUNCTION engine.build_instance_historical(p_forecast_id uuid)
+CREATE OR REPLACE FUNCTION engine.build_instance_historical_core(p_forecast_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY INVOKER
@@ -178,56 +180,74 @@ END;
 $$;
 
 
--- ===================== PIPELINE WRAPPER (no math inside) =====================
-CREATE OR REPLACE FUNCTION engine.build_instance_historical(
+-- ========== AUDIT WRAPPER (explicit ids) ==========
+CREATE OR REPLACE FUNCTION engine.build_instance_historical_run(
   p_forecast_id uuid,
-  p_run_id uuid DEFAULT NULL
+  p_run_id uuid
 )
 RETURNS void
 LANGUAGE plpgsql
 SECURITY INVOKER
 AS $$
-DECLARE
-  _rowcount bigint;
 BEGIN
-  -- Prevent concurrent builds for the same forecast_id within this transaction
-  IF NOT pg_try_advisory_xact_lock(6804, hashtext(p_forecast_id::text)) THEN
-    RAISE EXCEPTION 'Historical build already running for %', p_forecast_id USING ERRCODE = '55P03';
-  END IF;
+  INSERT INTO engine.instance_runs(run_id, forecast_id, phase, status, started_at)
+  VALUES (p_run_id, p_forecast_id, 'historical', 'running', now())
+  ON CONFLICT (run_id) DO UPDATE
+    SET status='running', started_at=now(), error_text=NULL;
 
-  -- Audit start (optional)
-  IF p_run_id IS NOT NULL THEN
-    INSERT INTO engine.instance_runs(run_id, forecast_id, phase, model, series, status, started_at)
-    VALUES (p_run_id, p_forecast_id, 'historical', NULL, NULL, 'running', now())
-    ON CONFLICT (run_id) DO UPDATE
-      SET status='running', started_at=now(), error_text=NULL;
-  END IF;
+  PERFORM engine.build_instance_historical_core(p_forecast_id);
 
-  -- Call the original 1-arg function (contains ALL the math/logic)
-  PERFORM engine.build_instance_historical(p_forecast_id);
+  UPDATE engine.instance_runs
+    SET status='succeeded',
+        finished_at=now(),
+        rowcount = (SELECT COUNT(*) FROM engine.instance_historical WHERE forecast_id = p_forecast_id)
+  WHERE run_id = p_run_id;
 
-  -- Audit success
-  IF p_run_id IS NOT NULL THEN
-    UPDATE engine.instance_runs
-      SET status='succeeded',
-          finished_at=now(),
-          rowcount = (SELECT COUNT(*) FROM engine.instance_historical WHERE forecast_id = p_forecast_id)
-    WHERE run_id = p_run_id;
-  END IF;
-
-  -- Registry state advance for orchestrator
   PERFORM engine.registry_touch(p_forecast_id, 'historical_ready', NULL);
-
-EXCEPTION WHEN OTHERS THEN
-  IF p_run_id IS NOT NULL THEN
-    UPDATE engine.instance_runs
-      SET status='failed', finished_at=now(), error_text = SQLERRM
-    WHERE run_id = p_run_id;
-  END IF;
-  RAISE;
 END;
 $$;
 
--- Execution privileges
-GRANT EXECUTE ON FUNCTION engine.build_instance_historical(uuid) TO matrix_reader, tsf_engine_app;
-GRANT EXECUTE ON FUNCTION engine.build_instance_historical(uuid, uuid) TO matrix_reader, tsf_engine_app;
+
+-- ========== ZERO-ARG WRAPPER (auto-picks latest id) ==========
+CREATE OR REPLACE FUNCTION engine.build_instance_historical()
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+AS $$
+DECLARE
+  _fid uuid;
+  _run uuid := gen_random_uuid();
+BEGIN
+  -- Prefer newest id in staging
+  SELECT sh.forecast_id
+  INTO _fid
+  FROM engine.staging_historical sh
+  WHERE sh.forecast_id IS NOT NULL
+  ORDER BY sh.uploaded_at DESC NULLS LAST, sh.created_at DESC NULLS LAST
+  LIMIT 1;
+
+  -- Fallback: latest 'staged' in registry
+  IF _fid IS NULL THEN
+    SELECT fr.forecast_id
+    INTO _fid
+    FROM engine.forecast_registry fr
+    WHERE fr.status = 'staged'
+    ORDER BY fr.updated_at DESC, fr.created_at DESC
+    LIMIT 1;
+  END IF;
+
+  IF _fid IS NULL THEN
+    RAISE EXCEPTION 'No forecast_id found. Upload a CSV to engine.staging_historical first.';
+  END IF;
+
+  PERFORM engine.build_instance_historical_run(_fid, _run);
+END;
+$$;
+
+
+-- Grants
+GRANT EXECUTE ON FUNCTION engine.build_instance_historical() TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_instance_historical_run(uuid, uuid) TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_instance_historical_core(uuid) TO matrix_reader, tsf_engine_app;
+
+COMMIT;

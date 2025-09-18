@@ -1,17 +1,24 @@
 -- V4_07_SR_Series_SQ.sql
--- Milestone 2: preserve original SR SQ-series logic and add wrapper that creates destination tables if missing.
--- VC V4.0 (2025-09-17):
---   * Original function engine.build_sr_series_sq(uuid) kept verbatim below.
---   * New wrapper engine.build_sr_series_sq(uuid, uuid) ensures destination tables exist (no math changes), then calls original.
---   * Grants aligned to matrix_reader and tsf_engine_app.
+-- Milestone 2 (Zero-Arg & Disambiguated)
+-- VC V4.07 (2025-09-17) — FIX: Wrapper CREATE TABLE column names aligned to V3 (smv/qsr/msr and q_* lookbacks/blends); added drop for existing *_core signature; no other changes.
+--   * Derived from V3_07_SR_Series_SQ.sql; core logic preserved.
+--   * Only change: destination tables are created if missing (type-safe, PK on (forecast_id,date), created_at).
+--   * Added wrapper identical in pattern to V4_06 (zero-arg), with SQ column names.
+BEGIN;
 
+-- Clean out older overloads to avoid ambiguity
+DROP FUNCTION IF EXISTS engine.build_sr_series_sq() CASCADE;
+DROP FUNCTION IF EXISTS engine.build_sr_series_sq(uuid) CASCADE;
+DROP FUNCTION IF EXISTS engine.build_sr_series_sq(uuid, uuid) CASCADE;
+
+DROP FUNCTION IF EXISTS engine.build_sr_series_sq_core(uuid) CASCADE;
 -- REPLACE: engine.build_sr_series_sq(uuid)
 -- VC 1.1 (2025-09-12): PASS 2 optimized with set-based DISTINCT ON update; covering index
 --                      (forecast_id, <model>_yqm, date) INCLUDE (<model>_qsr, <model>_msr); ANALYZE before update.
 -- VC 2.0 (2025-09-13): OPT — session tuning, progress notices & timings, ANALYZE after PASS 2B and PASS 3 (logic unchanged).
 
 BEGIN;
-CREATE OR REPLACE FUNCTION engine.build_sr_series_sq(p_forecast_id uuid DEFAULT NULL)
+CREATE OR REPLACE FUNCTION engine.build_sr_series_sq_core(p_forecast_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
@@ -25,6 +32,11 @@ DECLARE
   _t_start timestamptz := clock_timestamp();
   _t_pass  timestamptz;
   _rows    bigint;
+  t_main text;
+  t_yqm text;
+  t_k1 text;
+  t_k2 text;
+  t_k3 text;
 BEGIN
   -- Session tuning (best-effort; ignored if not permitted)
   BEGIN
@@ -81,12 +93,83 @@ BEGIN
 
     RAISE NOTICE '[%] SERIES % — target table engine.%', clock_timestamp(), mdl.model, out_tbl;
 
-    IF NOT EXISTS (
-      SELECT 1 FROM information_schema.tables
-      WHERE table_schema='engine' AND table_name=out_tbl
-    ) THEN
-      RAISE EXCEPTION 'Target table engine.% does not exist. Create it first.', out_tbl;
-    END IF;
+    
+IF NOT EXISTS (
+  SELECT 1 FROM information_schema.tables
+  WHERE table_schema='engine' AND table_name=out_tbl
+) THEN
+  -- infer types from the model table
+  SELECT
+    (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=mdl.model||'_q')     AS t_main,
+    (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=mdl.model||'_yqm')   AS t_yqm,
+    (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=mdl.model||'_q_p1_k') AS t_k1,
+    (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=mdl.model||'_q_p2_k') AS t_k2,
+    (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=mdl.model||'_q_p3_k') AS t_k3
+  INTO t_main, t_yqm, t_k1, t_k2, t_k3;
+
+  EXECUTE format($ct$
+    CREATE TABLE engine.%I (
+      forecast_id uuid NOT NULL,
+      date        date NOT NULL,
+      value       double precision,
+      qmv         double precision,
+      mmv         double precision,
+      %I %s,
+      %I %s,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I %s,
+      %I %s,
+      %I %s,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      %I double precision,
+      created_at timestamptz DEFAULT now(),
+      PRIMARY KEY (forecast_id, date)
+    );
+  $ct$,
+    out_tbl,
+    mdl.model||'_q',     t_main,
+    mdl.model||'_yqm',   t_yqm,
+    mdl.model||'_smv',
+    mdl.model||'_qsr',
+    mdl.model||'_msr',
+    mdl.model||'_q_p1_k', t_k1,
+    mdl.model||'_q_p2_k', t_k2,
+    mdl.model||'_q_p3_k', t_k3,
+    mdl.model||'_q_p1_qsr',
+    mdl.model||'_q_p1_msr',
+    mdl.model||'_q_p2_qsr',
+    mdl.model||'_q_p2_msr',
+    mdl.model||'_q_p3_qsr',
+    mdl.model||'_q_p3_msr',
+    mdl.model||'_q_fqsr_a1',
+    mdl.model||'_q_fqsr_a2',
+    mdl.model||'_q_fqsr_a2w',
+    mdl.model||'_q_fqsr_a3',
+    mdl.model||'_q_fqsr_a3w',
+    mdl.model||'_q_fmsr_a1',
+    mdl.model||'_q_fmsr_a2',
+    mdl.model||'_q_fmsr_a2w',
+    mdl.model||'_q_fmsr_a3',
+    mdl.model||'_q_fmsr_a3w'
+  );
+END IF;
+
 
     -- PASS 1: base insert with UPSERT
     _t_pass := clock_timestamp();
@@ -314,12 +397,8 @@ END;
 $$;
 COMMIT;
 
-
--- ===================== PIPELINE WRAPPER (no math changes) =====================
-CREATE OR REPLACE FUNCTION engine.build_sr_series_sq(
-  p_forecast_id uuid,
-  p_run_id uuid DEFAULT NULL
-)
+-- ===================== ZERO-ARG WRAPPER (creates dest tables, no math changes) — SQ =====================
+CREATE OR REPLACE FUNCTION engine.build_sr_series_sq()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY INVOKER
@@ -328,37 +407,25 @@ DECLARE
   fid uuid;
   mdl record;
   out_tbl text;
-  -- dynamic identifier variables
-  c_q    text;
-  c_yqm  text;
-  c_smv  text;
-  c_qsr  text;
-  c_msr  text;
-  c_k1   text;
-  c_k2   text;
-  c_k3   text;
-  c_p1_qsr text; c_p1_msr text;
-  c_p2_qsr text; c_p2_msr text;
-  c_p3_qsr text; c_p3_msr text;
-  c_fqsr_a1 text; c_fqsr_a2 text; c_fqsr_a2w text; c_fqsr_a3 text; c_fqsr_a3w text;
-  c_fmsr_a1 text; c_fmsr_a2 text; c_fmsr_a2w text; c_fmsr_a3 text; c_fmsr_a3w text;
-  -- source types
-  t_q    text;
-  t_yqm  text;
-  t_k1   text;
-  t_k2   text;
-  t_k3   text;
+  col_base text;  -- <model>
+  col_q    text;  -- <model>_q
+  col_yqm  text;  -- <model>_yqm
+  col_k1   text;  -- <model>_q_p1_k
+  col_k2   text;  -- <model>_q_p2_k
+  col_k3   text;  -- <model>_q_p3_k
+  t_q   text;
+  t_yqm text;
+  t_k1  text;
+  t_k2  text;
+  t_k3  text;
 BEGIN
-  -- Determine forecast_id as original function does
-  IF p_forecast_id IS NULL THEN
-    SELECT ih.forecast_id INTO fid
-    FROM engine.instance_historical ih
-    GROUP BY ih.forecast_id
-    ORDER BY MAX(ih.created_at) DESC NULLS LAST
-    LIMIT 1;
-  ELSE
-    fid := p_forecast_id;
-  END IF;
+  SELECT ih.forecast_id
+  INTO fid
+  FROM engine.instance_historical ih
+  GROUP BY ih.forecast_id
+  ORDER BY MAX(ih.created_at) DESC NULLS LAST
+  LIMIT 1;
+
   IF fid IS NULL THEN
     RAISE EXCEPTION 'No forecast_id found in engine.instance_historical.';
   END IF;
@@ -368,65 +435,46 @@ BEGIN
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname='engine' AND c.relkind IN ('r','f')
-      AND EXISTS (SELECT 1 FROM information_schema.columns
-                  WHERE table_schema='engine' AND table_name=c.relname AND column_name='date')
-      AND EXISTS (SELECT 1 FROM information_schema.columns
-                  WHERE table_schema='engine' AND table_name=c.relname AND column_name=c.relname||'_q')
-      AND EXISTS (SELECT 1 FROM information_schema.columns
-                  WHERE table_schema='engine' AND table_name=c.relname AND column_name=c.relname||'_yqm')
-      AND EXISTS (SELECT 1 FROM information_schema.columns
-                  WHERE table_schema='engine' AND table_name=c.relname AND column_name=c.relname||'_q_p1_k')
-      AND EXISTS (SELECT 1 FROM information_schema.columns
-                  WHERE table_schema='engine' AND table_name=c.relname AND column_name=c.relname||'_q_p2_k')
-      AND EXISTS (SELECT 1 FROM information_schema.columns
-                  WHERE table_schema='engine' AND table_name=c.relname AND column_name=c.relname||'_q_p3_k')
-    ORDER BY c.relname
+      AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=c.relname AND column_name='date')
   LOOP
     out_tbl := mdl.model || '_instance_sr_sq';
 
-    -- build identifier names
-    c_q    := mdl.model||'_q';
-    c_yqm  := mdl.model||'_yqm';
-    c_smv  := mdl.model||'_smv';
-    c_qsr  := mdl.model||'_qsr';
-    c_msr  := mdl.model||'_msr';
-    c_k1   := mdl.model||'_q_p1_k';
-    c_k2   := mdl.model||'_q_p2_k';
-    c_k3   := mdl.model||'_q_p3_k';
+    col_base := mdl.model;
+    col_q    := mdl.model||'_q';
+    col_yqm  := mdl.model||'_yqm';
+    col_k1   := mdl.model||'_q_p1_k';
+    col_k2   := mdl.model||'_q_p2_k';
+    col_k3   := mdl.model||'_q_p3_k';
 
-    c_p1_qsr := mdl.model||'_q_p1_qsr';
-    c_p1_msr := mdl.model||'_q_p1_msr';
-    c_p2_qsr := mdl.model||'_q_p2_qsr';
-    c_p2_msr := mdl.model||'_q_p2_msr';
-    c_p3_qsr := mdl.model||'_q_p3_qsr';
-    c_p3_msr := mdl.model||'_q_p3_msr';
+    -- ensure required driver columns exist on model table
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=mdl.model AND column_name=col_q) THEN
+      CONTINUE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=mdl.model AND column_name=col_yqm) THEN
+      CONTINUE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=mdl.model AND column_name=col_k1) THEN
+      CONTINUE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=mdl.model AND column_name=col_k2) THEN
+      CONTINUE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=mdl.model AND column_name=col_k3) THEN
+      CONTINUE;
+    END IF;
 
-    c_fqsr_a1  := mdl.model||'_q_fqsr_a1';
-    c_fqsr_a2  := mdl.model||'_q_fqsr_a2';
-    c_fqsr_a2w := mdl.model||'_q_fqsr_a2w';
-    c_fqsr_a3  := mdl.model||'_q_fqsr_a3';
-    c_fqsr_a3w := mdl.model||'_q_fqsr_a3w';
-
-    c_fmsr_a1  := mdl.model||'_q_fmsr_a1';
-    c_fmsr_a2  := mdl.model||'_q_fmsr_a2';
-    c_fmsr_a2w := mdl.model||'_q_fmsr_a2w';
-    c_fmsr_a3  := mdl.model||'_q_fmsr_a3';
-    c_fmsr_a3w := mdl.model||'_q_fmsr_a3w';
-
-    -- source types from model table
-    SELECT
-      (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=c_q)   AS t_q,
-      (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=c_yqm) AS t_yqm,
-      (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=c_k1)  AS t_k1,
-      (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=c_k2)  AS t_k2,
-      (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=c_k3)  AS t_k3
-    INTO t_q, t_yqm, t_k1, t_k2, t_k3;
-
-    -- create destination table if missing
     IF NOT EXISTS (
       SELECT 1 FROM information_schema.tables
       WHERE table_schema='engine' AND table_name=out_tbl
     ) THEN
+      SELECT
+        (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=col_q)    AS t_q,
+        (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=col_yqm)  AS t_yqm,
+        (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=col_k1)   AS t_k1,
+        (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=col_k2)   AS t_k2,
+        (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class cc ON cc.oid=a.attrelid JOIN pg_namespace nn ON nn.oid=cc.relnamespace WHERE nn.nspname='engine' AND cc.relname=mdl.model AND a.attname=col_k3)   AS t_k3
+      INTO t_q, t_yqm, t_k1, t_k2, t_k3;
+
       EXECUTE format($ct$
         CREATE TABLE engine.%I (
           forecast_id uuid NOT NULL,
@@ -434,71 +482,71 @@ BEGIN
           value       double precision,
           qmv         double precision,
           mmv         double precision,
-          %I %s,
-          %I %s,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I %s,
-          %I %s,
-          %I %s,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
-          %I double precision,
+          %I %s,                  -- <model>_q
+          %I %s,                  -- <model>_yqm
+          %I double precision,    -- <model>_smv
+          %I double precision,    -- <model>_qsr
+          %I double precision,    -- <model>_msr
+          %I %s,                  -- <model>_q_p1_k
+          %I %s,                  -- <model>_q_p2_k
+          %I %s,                  -- <model>_q_p3_k
+          %I double precision,    -- <model>_q_p1_qsr
+          %I double precision,    -- <model>_q_p1_msr
+          %I double precision,    -- <model>_q_p2_qsr
+          %I double precision,    -- <model>_q_p2_msr
+          %I double precision,    -- <model>_q_p3_qsr
+          %I double precision,    -- <model>_q_p3_msr
+          %I double precision,    -- <model>_q_fqsr_a1
+          %I double precision,    -- <model>_q_fqsr_a2
+          %I double precision,    -- <model>_q_fqsr_a2w
+          %I double precision,    -- <model>_q_fqsr_a3
+          %I double precision,    -- <model>_q_fqsr_a3w
+          %I double precision,    -- <model>_q_fmsr_a1
+          %I double precision,    -- <model>_q_fmsr_a2
+          %I double precision,    -- <model>_q_fmsr_a2w
+          %I double precision,    -- <model>_q_fmsr_a3
+          %I double precision,    -- <model>_q_fmsr_a3w
           created_at timestamptz DEFAULT now(),
           PRIMARY KEY (forecast_id, date)
-        );
+        )
       $ct$,
         out_tbl,
-        c_q,   t_q,
-        c_yqm, t_yqm,
-        c_smv,
-        c_qsr,
-        c_msr,
-        c_k1,  t_k1,
-        c_k2,  t_k2,
-        c_k3,  t_k3,
-        c_p1_qsr,
-        c_p1_msr,
-        c_p2_qsr,
-        c_p2_msr,
-        c_p3_qsr,
-        c_p3_msr,
-        c_fqsr_a1,
-        c_fqsr_a2,
-        c_fqsr_a2w,
-        c_fqsr_a3,
-        c_fqsr_a3w,
-        c_fmsr_a1,
-        c_fmsr_a2,
-        c_fmsr_a2w,
-        c_fmsr_a3,
-        c_fmsr_a3w
+        col_q,   t_q,
+        col_yqm, t_yqm,
+        col_base||'_smv',
+        col_base||'_qsr',
+        col_base||'_msr',
+        col_k1,  t_k1,
+        col_k2,  t_k2,
+        col_k3,  t_k3,
+        col_base||'_q_p1_qsr',
+        col_base||'_q_p1_msr',
+        col_base||'_q_p2_qsr',
+        col_base||'_q_p2_msr',
+        col_base||'_q_p3_qsr',
+        col_base||'_q_p3_msr',
+        col_base||'_q_fqsr_a1',
+        col_base||'_q_fqsr_a2',
+        col_base||'_q_fqsr_a2w',
+        col_base||'_q_fqsr_a3',
+        col_base||'_q_fqsr_a3w',
+        col_base||'_q_fmsr_a1',
+        col_base||'_q_fmsr_a2',
+        col_base||'_q_fmsr_a2w',
+        col_base||'_q_fmsr_a3',
+        col_base||'_q_fmsr_a3w'
       );
 
-      -- grants
       EXECUTE format('GRANT SELECT ON engine.%I TO matrix_reader', out_tbl);
       EXECUTE format('GRANT SELECT, INSERT, UPDATE ON engine.%I TO tsf_engine_app', out_tbl);
     END IF;
   END LOOP;
 
-  -- Call the original function (contains all math/logic)
-  PERFORM engine.build_sr_series_sq(fid);
+  PERFORM engine.build_sr_series_sq_core(fid);
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION engine.build_sr_series_sq(uuid) TO matrix_reader, tsf_engine_app;
-GRANT EXECUTE ON FUNCTION engine.build_sr_series_sq(uuid, uuid) TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_sr_series_sq() TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_sr_series_sq_core(uuid) TO matrix_reader, tsf_engine_app;
+
+COMMIT;

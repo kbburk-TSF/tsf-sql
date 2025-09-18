@@ -1,17 +1,20 @@
 -- V4_08_SR_Series_SQM.sql
--- Milestone 2: preserve original SR SQM-series logic and add wrapper that creates destination tables if missing.
--- VC V4.0 (2025-09-17):
---   * Original function engine.build_sr_series_sqm(uuid) kept verbatim below (no math/logic changes).
---   * New wrapper engine.build_sr_series_sqm(uuid, uuid) ensures destination tables exist (schema only), then calls original.
---   * Grants aligned to matrix_reader and tsf_engine_app.
-
--- REPLACE: engine.build_sr_series_sqm(uuid)
--- VC 1.1 (2025-09-12): PASS 2 optimized with set-based DISTINCT ON update; covering index
---                      (forecast_id, <model>_yqm, date) INCLUDE (<model>_qsr, <model>_msr); ANALYZE before update.
--- VC 2.0 (2025-09-13): OPT — session tuning, progress notices & timings, ANALYZE after PASS 2B and PASS 3 (logic unchanged).
+-- Milestone 2 (Zero-Arg & Disambiguated)
+-- VC V4.08 (2025-09-17) — FIX: Wrapper pattern matched to V4_07 (SQ) for SQM; disambiguation DROPs; zero-arg wrapper; core logic preserved.
+--   * Derived from prior SQM CANNON; core logic preserved exactly.
+--   * Only change: destination tables are created if missing via wrapper (schema only), and wrappers follow V4_07 pattern.
 
 BEGIN;
-CREATE OR REPLACE FUNCTION engine.build_sr_series_sqm(p_forecast_id uuid DEFAULT NULL)
+
+-- Clean out older overloads to avoid ambiguity
+DROP FUNCTION IF EXISTS engine.build_sr_series_sqm() CASCADE;
+DROP FUNCTION IF EXISTS engine.build_sr_series_sqm(uuid) CASCADE;
+DROP FUNCTION IF EXISTS engine.build_sr_series_sqm(uuid, uuid) CASCADE;
+DROP FUNCTION IF EXISTS engine.build_sr_series_sqm_core(uuid) CASCADE;
+COMMIT;
+
+BEGIN;
+CREATE OR REPLACE FUNCTION engine.build_sr_series_sqm_core(p_forecast_id uuid DEFAULT NULL)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
@@ -316,12 +319,7 @@ END;
 $$;
 COMMIT;
 
-
--- ===================== PIPELINE WRAPPER (no math changes) =====================
-CREATE OR REPLACE FUNCTION engine.build_sr_series_sqm(
-  p_forecast_id uuid,
-  p_run_id uuid DEFAULT NULL
-)
+CREATE OR REPLACE FUNCTION engine.build_sr_series_sqm()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY INVOKER
@@ -351,15 +349,15 @@ DECLARE
   t_k2   text;
   t_k3   text;
 BEGIN
-  -- Determine forecast_id as original function does
-  IF p_forecast_id IS NULL THEN
-    SELECT ih.forecast_id INTO fid
-    FROM engine.instance_historical ih
-    GROUP BY ih.forecast_id
-    ORDER BY MAX(ih.created_at) DESC NULLS LAST
-    LIMIT 1;
-  ELSE
-    fid := p_forecast_id;
+  SELECT ih.forecast_id
+  INTO fid
+  FROM engine.instance_historical ih
+  GROUP BY ih.forecast_id
+  ORDER BY MAX(ih.created_at) DESC NULLS LAST
+  LIMIT 1;
+
+  IF fid IS NULL THEN
+    RAISE EXCEPTION 'No forecast_id found in engine.instance_historical.';
   END IF;
   IF fid IS NULL THEN
     RAISE EXCEPTION 'No forecast_id found in engine.instance_historical.';
@@ -498,9 +496,10 @@ BEGIN
   END LOOP;
 
   -- Call the original function (contains all math/logic)
-  PERFORM engine.build_sr_series_sqm(fid);
+  PERFORM engine.build_sr_series_sqm_core(fid);
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION engine.build_sr_series_sqm(uuid) TO matrix_reader, tsf_engine_app;
-GRANT EXECUTE ON FUNCTION engine.build_sr_series_sqm(uuid, uuid) TO matrix_reader, tsf_engine_app;
+
+GRANT EXECUTE ON FUNCTION engine.build_sr_series_sqm() TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_sr_series_sqm_core(uuid) TO matrix_reader, tsf_engine_app;

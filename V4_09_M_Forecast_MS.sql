@@ -1,18 +1,30 @@
--- V4_09_M_Forecast_S.sql
--- Milestone 2: preserve original M-forecast S-series logic and add wrapper to create destination tables if missing.
--- VC V4.0 (2025-09-17):
---   * Original function engine.build_forecast_ms_s() kept verbatim below (no math/logic changes).
---   * New wrapper engine.build_forecast_ms_s(p_run_id uuid DEFAULT NULL) ensures:
---       - Compatibility view binom.binom_p -> engine.binom_p (no FDW required)
---       - Destination tables engine.<base>_instance_forecast_ms exist
---     Then calls the original function to perform the full build.
---   * Grants aligned to matrix_reader and tsf_engine_app.
+-- VC V4.09.2 (2025-09-17): Clean pass; removed stray characters; filename unchanged.
+-- No logic changes.
 
--- DEV BUILD v2025-09-13: S-series — build 48-variant forecast tables for EVERY date per SR table
- 
-CREATE OR REPLACE FUNCTION engine.build_forecast_ms_s()
+-- VC V4.09.1 (2025-09-17): CHANGE — binomial table moved to engine.binom_p (was public/binom.binom_p).
+-- No other edits.
+
+-- V4_09_M_Forecast_MS.sql
+-- VC V4.09 (2025-09-17): Clean build. Wrapper/headers only + ONE core change (create dest table if missing).
+-- Functions: engine.build_forecast_ms() [wrapper], engine.build_forecast_ms_core() [core].
+
+
+BEGIN;
+DROP FUNCTION IF EXISTS engine.build_forecast_ms();
+DROP FUNCTION IF EXISTS engine.build_forecast_ms(uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_ms(uuid, uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_core();
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_core(uuid);
+-- legacy
+DROP FUNCTION IF EXISTS engine.build_forecast_ms();
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_s(uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_s(uuid, uuid);
+COMMIT;
+
+CREATE OR REPLACE FUNCTION engine.build_forecast_ms_core()
 RETURNS void
 AS $$
+
 
 DECLARE
   -- ====== TOGGLES (A) ======
@@ -133,7 +145,43 @@ BEGIN
     END IF;
     dest_rel  := base || '_instance_forecast_ms';
     dest_qual := format('%I.%I', 'engine', dest_rel);
-    IF to_regclass(dest_qual) IS NULL THEN RAISE EXCEPTION 'destination missing: %', dest_qual; END IF;
+    IF to_regclass(dest_qual) IS NULL THEN
+  EXECUTE format($ct$
+    CREATE TABLE %s (
+      forecast_id uuid NOT NULL,
+      date date NOT NULL,
+      value numeric(18,4),
+      series text,
+      season text,
+      model_name text,
+      base_model text,
+      base_fv numeric,
+      fmsr_series text,
+      fmsr_value numeric,
+      fv numeric,
+      fv_error numeric,
+      fv_mae numeric,
+      fv_mean_mae numeric,
+      fv_mean_mae_c numeric,
+      fv_u numeric,
+      fv_l numeric,
+      mae_comparison text,
+      mean_mae_comparison text,
+      accuracy_comparison text,
+      best_fm_count integer,
+      best_fm_odds numeric,
+      best_fm_sig numeric,
+      fv_interval text,
+      fv_interval_c integer,
+      fv_interval_odds numeric,
+      fv_interval_sig numeric,
+      fv_variance numeric,
+      fv_variance_mean numeric,
+      created_at timestamptz DEFAULT now(),
+      PRIMARY KEY (forecast_id, date, model_name, fmsr_series)
+    )
+  $ct$, dest_qual);
+END IF;
     -- Determine destination column names (prefer 'series'/'season'; fallback to legacy)
     dest_series_col := 'series';
     dest_season_col := 'season';
@@ -551,7 +599,7 @@ EXECUTE format($i$
     EXECUTE format($l$
       CREATE TEMP TABLE binom_p_local AS
       SELECT p.*
-      FROM binom.binom_p p
+      FROM engine.binom_p p
       WHERE p.n <= (SELECT COALESCE(max(fv_mean_mae_c)::int, 0) FROM %s)
     $l$, dest_qual);
     CREATE INDEX ON binom_p_local (n, k);
@@ -714,98 +762,18 @@ EXECUTE format($i$
   RAISE NOTICE '[%] ALL DONE (total elapsed: %.3f s)', clock_timestamp(),
     EXTRACT(epoch FROM clock_timestamp() - t_run_start);
 END
+
 $$ LANGUAGE plpgsql;
 
-
--- ===================== PIPELINE WRAPPER (no math changes) =====================
-CREATE OR REPLACE FUNCTION engine.build_forecast_ms_s(
-  p_run_id uuid DEFAULT NULL  -- reserved for symmetry; not used inside the original function
-)
+CREATE OR REPLACE FUNCTION engine.build_forecast_ms()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY INVOKER
 AS $$
-DECLARE
-  r record;
-  base text;
-  dest_rel text;
-  ddl text;
 BEGIN
-  -- Ensure compatibility view for binomial lookup (original function expects binom.binom_p)
-  PERFORM 1 FROM pg_namespace WHERE nspname = 'binom';
-  IF NOT FOUND THEN
-    EXECUTE 'CREATE SCHEMA binom';
-  END IF;
-  IF to_regclass('binom.binom_p') IS NULL THEN
-    -- If a foreign table or view already exists we skip; otherwise create a simple passthrough view
-    EXECUTE 'CREATE OR REPLACE VIEW binom.binom_p AS SELECT * FROM engine.binom_p';
-    GRANT USAGE ON SCHEMA binom TO matrix_reader, tsf_engine_app;
-    GRANT SELECT ON binom.binom_p TO matrix_reader, tsf_engine_app;
-  END IF;
-
-  -- Create missing destination tables for each S-series SR output
-  FOR r IN
-    SELECT tablename
-    FROM pg_catalog.pg_tables
-    WHERE schemaname = 'engine'
-      AND tablename LIKE '%\_instance\_sr\_s' ESCAPE '\'
-    ORDER BY tablename
-  LOOP
-    base := regexp_replace(r.tablename, '_instance_sr_s$', '');
-    dest_rel := base || '_instance_forecast_ms';
-
-    IF NOT EXISTS (
-      SELECT 1 FROM information_schema.tables
-      WHERE table_schema='engine' AND table_name=dest_rel
-    ) THEN
-      ddl := format($ct$
-        CREATE TABLE engine.%I (
-          forecast_id uuid NOT NULL,
-          date        date NOT NULL,
-          value       numeric(18,4),
-          series      text,
-          season      text,
-          model_name  text,
-          base_model  text,
-          base_fv     numeric(18,4),
-          fmsr_series text,
-          fmsr_value  numeric(18,4),
-          fv          numeric,
-          fv_error    numeric,
-          fv_mae      numeric,
-          fv_mean_mae numeric,
-          fv_mean_mae_c numeric,
-          fv_u        numeric,
-          fv_l        numeric,
-          mae_comparison      text,
-          mean_mae_comparison text,
-          accuracy_comparison text,
-          best_fm_count    numeric,
-          best_fm_odds     numeric,
-          best_fm_sig      numeric,
-          fv_interval      text,
-          fv_interval_c    numeric,
-          fv_interval_odds numeric,
-          fv_interval_sig  numeric,
-          fv_variance      numeric,
-          fv_variance_mean numeric,
-          created_at timestamptz DEFAULT now(),
-          PRIMARY KEY (forecast_id, date)
-        );
-      $ct$, dest_rel);
-      EXECUTE ddl;
-
-      -- Visibility & app access
-      EXECUTE format('GRANT SELECT ON engine.%I TO matrix_reader', dest_rel);
-      EXECUTE format('GRANT SELECT, INSERT, UPDATE ON engine.%I TO tsf_engine_app', dest_rel);
-    END IF;
-  END LOOP;
-
-  -- Call the original function to perform the actual build
-  PERFORM engine.build_forecast_ms_s();
-
+  PERFORM engine.build_forecast_ms_core();
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION engine.build_forecast_ms_s() TO matrix_reader, tsf_engine_app;
-GRANT EXECUTE ON FUNCTION engine.build_forecast_ms_s(uuid) TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_forecast_ms() TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_forecast_ms_core() TO matrix_reader, tsf_engine_app;

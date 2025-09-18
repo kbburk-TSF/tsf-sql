@@ -1,18 +1,24 @@
--- V4_10_M_Forecast_SQ.sql
--- Milestone 2: preserve original M-forecast SQ-series logic and add wrapper to create destination tables if missing.
--- VC V4.0 (2025-09-17):
---   * Original function engine.build_forecast_ms_sq() kept verbatim below (no math/logic changes).
---   * New wrapper engine.build_forecast_ms_sq(p_run_id uuid DEFAULT NULL) ensures:
---       - Compatibility view binom.binom_p -> engine.binom_p (no FDW required)
---       - Destination tables engine.<base>_instance_forecast_msq exist (standard column set)
---     Then calls the original function to perform the full build.
---   * Grants aligned to matrix_reader and tsf_engine_app.
+-- V4_11_M_Forecast_MSQM.sql
+-- VC V4.11 (2025-09-17): Wrapper/headers from V4_09; ONE core change to CREATE TABLE if missing; binom source updated to engine.binom_p.
+-- Functions: engine.build_forecast_msqm() [wrapper], engine.build_forecast_msqm_core() [core].
 
--- DEV BUILD v2025-09-13: S-series — build 48-variant forecast tables for EVERY date per SR table
- 
-CREATE OR REPLACE FUNCTION engine.build_forecast_ms_sq()
+
+BEGIN;
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm();
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm(uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm(uuid, uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm_core();
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm_core(uuid);
+-- legacy
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_sqm();
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_sqm(uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_sqm(uuid, uuid);
+COMMIT;
+
+CREATE OR REPLACE FUNCTION engine.build_forecast_msqm_core()
 RETURNS void
 AS $$
+
 
 DECLARE
   -- ====== TOGGLES (A) ======
@@ -101,13 +107,13 @@ BEGIN
     SELECT tablename
     FROM pg_catalog.pg_tables
     WHERE schemaname = 'engine'
-      AND tablename LIKE '%\_instance\_sr\_sq' ESCAPE '\'
+      AND tablename LIKE '%\_instance\_sr\_sqm' ESCAPE '\'
     ORDER BY tablename
   LOOP
     t_series_start := clock_timestamp();
 
     sr_rel  := r.tablename;
-    base    := regexp_replace(sr_rel, '_instance_sr_sq$', '');
+    base    := regexp_replace(sr_rel, '_instance_sr_sqm$', '');
     sr_qual := format('%I.%I', 'engine', sr_rel);
 
     RAISE NOTICE '[%] BEGIN series % — scanning latest forecast_id', clock_timestamp(), base;
@@ -131,9 +137,45 @@ BEGIN
       RAISE NOTICE '[%] SKIP series % — no historical', clock_timestamp(), base;
       CONTINUE;
     END IF;
-    dest_rel  := base || '_instance_forecast_msq';
+    dest_rel  := base || '_instance_forecast_msqm';
     dest_qual := format('%I.%I', 'engine', dest_rel);
-    IF to_regclass(dest_qual) IS NULL THEN RAISE EXCEPTION 'destination missing: %', dest_qual; END IF;
+    IF to_regclass(dest_qual) IS NULL THEN
+  EXECUTE format($ct$
+    CREATE TABLE %s (
+      forecast_id uuid NOT NULL,
+      date date NOT NULL,
+      value numeric(18,4),
+      series text,
+      season text,
+      model_name text,
+      base_model text,
+      base_fv numeric,
+      fmsr_series text,
+      fmsr_value numeric,
+      fv numeric,
+      fv_error numeric,
+      fv_mae numeric,
+      fv_mean_mae numeric,
+      fv_mean_mae_c numeric,
+      fv_u numeric,
+      fv_l numeric,
+      mae_comparison text,
+      mean_mae_comparison text,
+      accuracy_comparison text,
+      best_fm_count integer,
+      best_fm_odds numeric,
+      best_fm_sig numeric,
+      fv_interval text,
+      fv_interval_c integer,
+      fv_interval_odds numeric,
+      fv_interval_sig numeric,
+      fv_variance numeric,
+      fv_variance_mean numeric,
+      created_at timestamptz DEFAULT now(),
+      PRIMARY KEY (forecast_id, date, model_name, fmsr_series)
+    )
+  $ct$, dest_qual);
+END IF;
     -- Determine destination column names (prefer 'series'/'season'; fallback to legacy)
     dest_series_col := 'series';
     dest_season_col := 'season';
@@ -143,13 +185,13 @@ BEGIN
     IF NOT FOUND THEN dest_season_col := base || '_yqm'; END IF;
 
 
-    sr_base_col       := 'sr.' || quote_ident(base || '_q');
+    sr_base_col       := 'sr.' || quote_ident(base || '_qm');
     sr_yqm_col        := 'sr.' || quote_ident(base || '_yqm');
-    sr_fmsr_a1_col    := 'sr.' || quote_ident(base || '_q_fmsr_a1');
-    sr_fmsr_a2_col    := 'sr.' || quote_ident(base || '_q_fmsr_a2');
-    sr_fmsr_a2w_col   := 'sr.' || quote_ident(base || '_q_fmsr_a2w');
-    sr_fmsr_a3_col    := 'sr.' || quote_ident(base || '_q_fmsr_a3');
-    sr_fmsr_a3w_col   := 'sr.' || quote_ident(base || '_q_fmsr_a3w');
+    sr_fmsr_a1_col    := 'sr.' || quote_ident(base || '_qm_fmsr_a1');
+    sr_fmsr_a2_col    := 'sr.' || quote_ident(base || '_qm_fmsr_a2');
+    sr_fmsr_a2w_col   := 'sr.' || quote_ident(base || '_qm_fmsr_a2w');
+    sr_fmsr_a3_col    := 'sr.' || quote_ident(base || '_qm_fmsr_a3');
+    sr_fmsr_a3w_col   := 'sr.' || quote_ident(base || '_qm_fmsr_a3w');
 
     ------------------------------------------------------------------
     -- PASS 1 — CTAS
@@ -261,7 +303,7 @@ $f$,
       sr_qual, latest_id
     );
     EXECUTE sql;
-    -- keep dest_rel/dest_qual for _instance_forecast_msq
+    -- keep dest_rel/dest_qual for _instance_forecast_msqm
 EXECUTE format($i$
       INSERT INTO %1$s (
         forecast_id, "date", value, %2$I, %3$I, model_name, base_model, base_fv,
@@ -551,7 +593,7 @@ EXECUTE format($i$
     EXECUTE format($l$
       CREATE TEMP TABLE binom_p_local AS
       SELECT p.*
-      FROM binom.binom_p p
+      FROM engine.binom_p p
       WHERE p.n <= (SELECT COALESCE(max(fv_mean_mae_c)::int, 0) FROM %s)
     $l$, dest_qual);
     CREATE INDEX ON binom_p_local (n, k);
@@ -714,95 +756,18 @@ EXECUTE format($i$
   RAISE NOTICE '[%] ALL DONE (total elapsed: %.3f s)', clock_timestamp(),
     EXTRACT(epoch FROM clock_timestamp() - t_run_start);
 END
+
 $$ LANGUAGE plpgsql;
 
-
--- ===================== PIPELINE WRAPPER (no math changes) =====================
-CREATE OR REPLACE FUNCTION engine.build_forecast_ms_sq(
-  p_run_id uuid DEFAULT NULL  -- reserved for symmetry; not used inside the original function
-)
+CREATE OR REPLACE FUNCTION engine.build_forecast_msqm()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY INVOKER
 AS $$
-DECLARE
-  r record;
-  base text;
-  dest_rel text;
-  dest_qual text;
-  ddl text;
 BEGIN
-  -- Ensure compatibility view for binomial lookup (original function expects binom.binom_p)
-  PERFORM 1 FROM pg_namespace WHERE nspname = 'binom';
-  IF NOT FOUND THEN
-    EXECUTE 'CREATE SCHEMA binom';
-  END IF;
-  IF to_regclass('binom.binom_p') IS NULL THEN
-    EXECUTE 'CREATE OR REPLACE VIEW binom.binom_p AS SELECT * FROM engine.binom_p';
-    GRANT USAGE ON SCHEMA binom TO matrix_reader, tsf_engine_app;
-    GRANT SELECT ON binom.binom_p TO matrix_reader, tsf_engine_app;
-  END IF;
-
-  -- Create missing destination tables for each SQ-series SR output
-  FOR r IN
-    SELECT tablename
-    FROM pg_catalog.pg_tables
-    WHERE schemaname = 'engine'
-      AND tablename LIKE '%\_instance\_sr\_sq' ESCAPE '\'
-    ORDER BY tablename
-  LOOP
-    base := regexp_replace(r.tablename, '_instance_sr_sq$', '');
-    dest_rel  := base || '_instance_forecast_msq';
-    dest_qual := format('%I.%I', 'engine', dest_rel);
-
-    IF to_regclass(dest_qual) IS NULL THEN
-      ddl := format($ct$
-        CREATE TABLE engine.%I (
-          forecast_id uuid NOT NULL,
-          date        date NOT NULL,
-          value       numeric(18,4),
-          series      text,
-          season      text,
-          model_name  text,
-          base_model  text,
-          base_fv     numeric(18,4),
-          fmsr_series text,
-          fmsr_value  numeric(18,4),
-          fv          numeric,
-          fv_error    numeric,
-          fv_mae      numeric,
-          fv_mean_mae numeric,
-          fv_mean_mae_c numeric,
-          fv_u        numeric,
-          fv_l        numeric,
-          mae_comparison      text,
-          mean_mae_comparison text,
-          accuracy_comparison text,
-          best_fm_count    numeric,
-          best_fm_odds     numeric,
-          best_fm_sig      numeric,
-          fv_interval      text,
-          fv_interval_c    numeric,
-          fv_interval_odds numeric,
-          fv_interval_sig  numeric,
-          fv_variance      numeric,
-          fv_variance_mean numeric,
-          created_at timestamptz DEFAULT now(),
-          PRIMARY KEY (forecast_id, date)
-        );
-      $ct$, dest_rel);
-      EXECUTE ddl;
-
-      -- Visibility & app access
-      EXECUTE format('GRANT SELECT ON engine.%I TO matrix_reader', dest_rel);
-      EXECUTE format('GRANT SELECT, INSERT, UPDATE ON engine.%I TO tsf_engine_app', dest_rel);
-    END IF;
-  END LOOP;
-
-  -- Call the original function to perform the actual build
-  PERFORM engine.build_forecast_ms_sq();
+  PERFORM engine.build_forecast_msqm_core();
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION engine.build_forecast_ms_sq() TO matrix_reader, tsf_engine_app;
-GRANT EXECUTE ON FUNCTION engine.build_forecast_ms_sq(uuid) TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_forecast_msqm() TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_forecast_msqm_core() TO matrix_reader, tsf_engine_app;
