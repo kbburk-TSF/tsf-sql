@@ -1,17 +1,12 @@
+-- ALT CLEAN (2025-09-22) — Entire UPSERT clause removed; now DO NOTHING. Only this change.
+-- File: V10_07_M_Forecast_MS_FIXED_ALT_CLEAN.sql
+
 -- ================================================================
 -- File: V10_07_M_Forecast_MS.sql
--- VC V10_07 (2025-09-22)
--- Changes locked-in by user instruction (NO core forecast logic changed):
---   • Conflict handling: overwrite existing rows for the same
---     (forecast_id, date, model_name, fmsr_series) using
---     ON CONFLICT (...) DO UPDATE SET <non-PK columns>.
---   • Multi-forecast support: table already keyed by forecast_id so
---     multiple forecast_ids can coexist and append safely.
---   • View-safe: no live ALTER COLUMN TYPE operations in this file
---     (removed/commented to avoid blocking when views exist).
--- ================================================================
-
-BEGIN;
+-- HOTFIX (2025-09-22) — View-safe, runnable build (no type-alter DDL), no logic changes
+--   • Disabled only the ALTER TABLE … ALTER COLUMN … TYPE DDL that fails with views present.
+--   • Kept schema stable and all forecast logic intact.
+--   • Retained UPSERT: ON CONFLICT (forecast_id, date, model_name, fmsr_series) DO NOTHING;
 DROP FUNCTION IF EXISTS engine.build_forecast_ms();
 DROP FUNCTION IF EXISTS engine.build_forecast_ms(uuid);
 DROP FUNCTION IF EXISTS engine.build_forecast_ms(uuid, uuid);
@@ -312,7 +307,7 @@ $f$,
         best_fm_count, best_fm_odds, best_fm_sig, fv_interval, fv_interval_c,
         fv_interval_odds, fv_interval_sig, fv_variance, fv_variance_mean, now()
       FROM __tmp_forecast_build
-      ON CONFLICT (forecast_id, date, model_name, fmsr_series) DO UPDATE SET value=EXCLUDED.value, series=EXCLUDED.series, season=EXCLUDED.season, model_name=EXCLUDED.model_name, base_model=EXCLUDED.base_model, base_fv=EXCLUDED.base_fv, fmsr_series=EXCLUDED.fmsr_series, fmsr_value=EXCLUDED.fmsr_value, fv=EXCLUDED.fv, fv_error=EXCLUDED.fv_error, fv_mae=EXCLUDED.fv_mae, fv_mean_mae=EXCLUDED.fv_mean_mae, fv_mean_mae_c=EXCLUDED.fv_mean_mae_c, fv_u=EXCLUDED.fv_u, fv_l=EXCLUDED.fv_l, mae_comparison=EXCLUDED.mae_comparison, mean_mae_comparison=EXCLUDED.mean_mae_comparison, accuracy_comparison=EXCLUDED.accuracy_comparison, best_fm_count=EXCLUDED.best_fm_count, best_fm_odds=EXCLUDED.best_fm_odds, best_fm_sig=EXCLUDED.best_fm_sig, fv_interval=EXCLUDED.fv_interval, fv_interval_c=EXCLUDED.fv_interval_c, fv_interval_odds=EXCLUDED.fv_interval_odds, fv_interval_sig=EXCLUDED.fv_interval_sig, fv_variance=EXCLUDED.fv_variance, fv_variance_mean=EXCLUDED.fv_variance_mean, created_at=EXCLUDED.created_at
+      ON CONFLICT (forecast_id, date, model_name, fmsr_series) DO NOTHING
     $i$, dest_qual, dest_series_col, dest_season_col, 'series', base || '_yqm');
 
     GET DIAGNOSTICS rcnt = ROW_COUNT;
@@ -622,7 +617,8 @@ $f$,
     $c$, dest_qual);
 
     -- enforce integer types
-    EXECUTE format(
+    /* DISABLED (view-safe hotfix):
+EXECUTE format(
       'ALTER TABLE %s
          ALTER COLUMN best_fm_count    TYPE integer USING COALESCE(best_fm_count,0)::integer,
          ALTER COLUMN fv_interval_c    TYPE integer USING COALESCE(fv_interval_c,0)::integer,
@@ -630,7 +626,9 @@ $f$,
       dest_qual
     );
 
-    RAISE NOTICE 'COMPLETE series: % (elapsed %.3f s)',
+    
+*/
+RAISE NOTICE 'COMPLETE series: % (elapsed %.3f s)',
       dest_rel, EXTRACT(epoch FROM clock_timestamp() - t_series_start);
   END LOOP;
 

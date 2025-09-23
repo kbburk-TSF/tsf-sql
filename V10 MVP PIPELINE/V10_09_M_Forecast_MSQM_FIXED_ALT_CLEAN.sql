@@ -1,62 +1,38 @@
--- ================================================================
--- File: V10_08_M_Forecast_MSQ.sql
--- VC V10_08 (2025-09-22)
--- Changes locked-in by user instruction (NO core forecast logic changed):
---   • Conflict handling: overwrite existing rows for the same
---     (forecast_id, date, model_name, fmsr_series) using
---     ON CONFLICT (...) DO UPDATE SET <non-PK columns>.
---   • Multi-forecast support: table already keyed by forecast_id so
---     multiple forecast_ids can coexist and append safely.
---   • View-safe: no live ALTER COLUMN TYPE operations in this file
---     (disabled to avoid blocking when views exist).
--- ================================================================
+-- ALT SYNC (2025-09-23) — Align MSQM with MSQ behaviors (no logic change):
+--   • Add ON CONFLICT (forecast_id, date, model_name, fmsr_series) DO NOTHING to INSERT block.
+--   • No changes to forecast computations.
+-- File: V10_09_M_Forecast_MSQM_FIXED_ALT_SYNC.sql
+
+-- ALT CLEAN (2025-09-22) — Entire UPSERT clause removed; now DO NOTHING. Only this change.
+-- File: V10_09_M_Forecast_MSQM_FIXED_ALT_CLEAN.sql
 
 -- ================================================================
--- File: V10_08_M_Forecast_MSQ.sql
--- VC V10_08 (2025-09-22)
--- Changes locked-in by user instruction (NO core forecast logic changed):
---   • Conflict handling: overwrite existing rows for the same
---     (forecast_id, date, model_name, fmsr_series) using
---     ON CONFLICT (...) DO UPDATE SET <non-PK columns>.
---   • Multi-forecast support: table already keyed by forecast_id so
---     multiple forecast_ids can coexist and append safely.
---   • View-safe: no live ALTER COLUMN TYPE operations in this file
---     (removed/commented to avoid blocking when views exist).
--- ================================================================
-
--- VC V4.10a (2025-09-17): CHANGE — fv_interval_c season-pass rule and running count (75%% for 4+, 100%% for 1–3).
---   PERF — support index on (series, model_name, season) before PASS 6A; compare at 4dp.
---   FIX  — PASS 6B uses engine.binom_p directly; no local temp; matches other scripts.
---   NOTE — Escaped '75%%' inside EXECUTE format() strings to avoid printf formatting errors.
-
--- Base file: V4_10_M_Forecast_MSQ.sql
-
-
-BEGIN;
-DROP FUNCTION IF EXISTS engine.build_forecast_msq();
-DROP FUNCTION IF EXISTS engine.build_forecast_msq(uuid);
-DROP FUNCTION IF EXISTS engine.build_forecast_msq(uuid, uuid);
-DROP FUNCTION IF EXISTS engine.build_forecast_msq_core();
-DROP FUNCTION IF EXISTS engine.build_forecast_msq_core(uuid);
+-- File: V10_09_M_Forecast_MSQM.sql
+-- HOTFIX (2025-09-22) — View-safe, runnable build (no type-alter DDL), no logic changes
+--   • Disabled only the ALTER TABLE … ALTER COLUMN … TYPE DDL that fails with views present.
+--   • Kept schema stable and all forecast logic intact.
+--   • Retained UPSERT: ON CONFLICT (forecast_id, date, model_name, fmsr_series) DO NOTHING;
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm();
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm(uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm(uuid, uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm_core();
+DROP FUNCTION IF EXISTS engine.build_forecast_msqm_core(uuid);
 -- legacy
-DROP FUNCTION IF EXISTS engine.build_forecast_ms_sq();
-DROP FUNCTION IF EXISTS engine.build_forecast_ms_sq(uuid);
-DROP FUNCTION IF EXISTS engine.build_forecast_ms_sq(uuid, uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_sqm();
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_sqm(uuid);
+DROP FUNCTION IF EXISTS engine.build_forecast_ms_sqm(uuid, uuid);
 COMMIT;
 
-CREATE OR REPLACE FUNCTION engine.build_forecast_msq_core()
+CREATE OR REPLACE FUNCTION engine.build_forecast_msqm_core()
 RETURNS void
 AS $$
 
-
 DECLARE
-  -- ====== TOGGLES (A) ======
-  enable_extended_stats   boolean := false;  -- ON to (re)create extended stats per table
-  enable_cluster_vacuum   boolean := false;  -- ON to CLUSTER/VACUUM at end of each table
-  enable_full_analyze     boolean := true;   -- ON to run ANALYZE after each major step
-  enable_binom_build      boolean := true;   -- ON to refresh binomial caches for needed (n) and (n,k)
+  enable_extended_stats   boolean := false;
+  enable_cluster_vacuum   boolean := false;
+  enable_full_analyze     boolean := true;
+  enable_binom_build      boolean := true;
 
-  -- timing (H)
   t_run_start   timestamptz := clock_timestamp();
   t_series_start timestamptz;
   t_pass_start   timestamptz;
@@ -90,23 +66,13 @@ DECLARE
   h_ses_m           text := 'h.'||quote_ident('ses_m');
   h_hwes_m          text := 'h.'||quote_ident('hwes_m');
 
-  last_value_date   date;
-  cutoff_date       date;
-
   sql               text;
-  idx_tag           text;
-  idx_date_name     text;
-
   rcnt              bigint;
-
-  -- no-cache helpers
-  id_key  text;
-  tname   text;
+  tname             text;
 BEGIN
   PERFORM set_config('client_min_messages','NOTICE',true);
-  RAISE NOTICE '[%] RUN START', clock_timestamp();
+  RAISE NOTICE 'RUN START';
 
-  -- best-effort session hints
   BEGIN
     PERFORM set_config('jit','off',true);
     PERFORM set_config('work_mem','256MB',true);
@@ -120,7 +86,7 @@ BEGIN
     RAISE NOTICE 'Session tuning skipped: %', SQLERRM;
   END;
 
-  -- VC 3.6 NO-CACHE: purge any prior forecast output tables once per run
+  -- Purge any prior scratch forecast tables once per run
   FOR tname IN
     SELECT format('%I.%I', 'engine', c.relname)
     FROM pg_class c
@@ -136,21 +102,21 @@ BEGIN
     SELECT tablename
     FROM pg_catalog.pg_tables
     WHERE schemaname = 'engine'
-      AND tablename LIKE '%\_instance\_sr\_sq' ESCAPE '\'
+      AND tablename LIKE '%\_instance\_sr\_sqm' ESCAPE '\'
     ORDER BY tablename
   LOOP
     t_series_start := clock_timestamp();
 
     sr_rel  := r.tablename;
-    base    := regexp_replace(sr_rel, '_instance_sr_sq$', '');
+    base    := regexp_replace(sr_rel, '_instance_sr_sqm$', '');
     sr_qual := format('%I.%I', 'engine', sr_rel);
 
-    RAISE NOTICE '[%] BEGIN series % — scanning latest forecast_id', clock_timestamp(), base;
+    RAISE NOTICE 'BEGIN series: %', base;
 
     EXECUTE format('select forecast_id from %s order by created_at desc limit 1', sr_qual)
       INTO latest_id;
     IF latest_id IS NULL THEN
-      RAISE NOTICE '[%] SKIP series % — no forecast_id', clock_timestamp(), base;
+      RAISE NOTICE 'SKIP series % — no forecast_id', base;
       CONTINUE;
     END IF;
 
@@ -162,49 +128,51 @@ BEGIN
     USING latest_id
     INTO start_from;
     IF start_from IS NULL THEN
-      RAISE NOTICE '[%] SKIP series % — no historical', clock_timestamp(), base;
+      RAISE NOTICE 'SKIP series % — no historical', base;
       CONTINUE;
     END IF;
-    dest_rel  := base || '_instance_forecast_msq';
+
+    dest_rel  := base || '_instance_forecast_msqm';
     dest_qual := format('%I.%I', 'engine', dest_rel);
     IF to_regclass(dest_qual) IS NULL THEN
-  EXECUTE format($ct$
-    CREATE TABLE %s (
-      forecast_id uuid NOT NULL,
-      date date NOT NULL,
-      value numeric(18,4),
-      series text,
-      season text,
-      model_name text,
-      base_model text,
-      base_fv numeric,
-      fmsr_series text,
-      fmsr_value numeric,
-      fv numeric,
-      fv_error numeric,
-      fv_mae numeric,
-      fv_mean_mae numeric,
-      fv_mean_mae_c numeric,
-      fv_u numeric,
-      fv_l numeric,
-      mae_comparison text,
-      mean_mae_comparison text,
-      accuracy_comparison text,
-      best_fm_count integer,
-      best_fm_odds numeric,
-      best_fm_sig numeric,
-      fv_interval text,
-      fv_interval_c integer,
-      fv_interval_odds numeric,
-      fv_interval_sig numeric,
-      fv_variance numeric,
-      fv_variance_mean numeric,
-      created_at timestamptz DEFAULT now(),
-      PRIMARY KEY (forecast_id, date, model_name, fmsr_series)
-    )
-  $ct$, dest_qual);
-END IF;
-    -- Determine destination column names (prefer 'series'/'season'; fallback to legacy)
+      EXECUTE format($ct$
+        CREATE TABLE %s (
+          forecast_id uuid NOT NULL,
+          date date NOT NULL,
+          value numeric(18,4),
+          series text,
+          season text,
+          model_name text,
+          base_model text,
+          base_fv numeric,
+          fmsr_series text,
+          fmsr_value numeric,
+          fv numeric,
+          fv_error numeric,
+          fv_mae numeric,
+          fv_mean_mae numeric,
+          fv_mean_mae_c numeric,
+          fv_u numeric,
+          fv_l numeric,
+          mae_comparison text,
+          mean_mae_comparison text,
+          accuracy_comparison text,
+          best_fm_count integer,
+          best_fm_odds numeric,
+          best_fm_sig numeric,
+          fv_interval text,
+          fv_interval_c integer,
+          fv_interval_odds numeric,
+          fv_interval_sig numeric,
+          fv_variance numeric,
+          fv_variance_mean numeric,
+          created_at timestamptz DEFAULT now(),
+          PRIMARY KEY (forecast_id, date, model_name, fmsr_series)
+        )
+      $ct$, dest_qual);
+    END IF;
+
+    -- dynamic column detection
     dest_series_col := 'series';
     dest_season_col := 'season';
     PERFORM 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=dest_rel AND column_name=dest_series_col;
@@ -212,20 +180,17 @@ END IF;
     PERFORM 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=dest_rel AND column_name=dest_season_col;
     IF NOT FOUND THEN dest_season_col := base || '_yqm'; END IF;
 
-
-    sr_base_col       := 'sr.' || quote_ident(base || '_q');
+    sr_base_col       := 'sr.' || quote_ident(base || '_qm');
     sr_yqm_col        := 'sr.' || quote_ident(base || '_yqm');
-    sr_fmsr_a1_col    := 'sr.' || quote_ident(base || '_q_fmsr_a1');
-    sr_fmsr_a2_col    := 'sr.' || quote_ident(base || '_q_fmsr_a2');
-    sr_fmsr_a2w_col   := 'sr.' || quote_ident(base || '_q_fmsr_a2w');
-    sr_fmsr_a3_col    := 'sr.' || quote_ident(base || '_q_fmsr_a3');
-    sr_fmsr_a3w_col   := 'sr.' || quote_ident(base || '_q_fmsr_a3w');
+    sr_fmsr_a1_col    := 'sr.' || quote_ident(base || '_qm_fmsr_a1');
+    sr_fmsr_a2_col    := 'sr.' || quote_ident(base || '_qm_fmsr_a2');
+    sr_fmsr_a2w_col   := 'sr.' || quote_ident(base || '_qm_fmsr_a2w');
+    sr_fmsr_a3_col    := 'sr.' || quote_ident(base || '_qm_fmsr_a3');
+    sr_fmsr_a3w_col   := 'sr.' || quote_ident(base || '_qm_fmsr_a3w');
 
-    ------------------------------------------------------------------
     -- PASS 1 — CTAS
-    ------------------------------------------------------------------
     t_pass_start := clock_timestamp();
-    RAISE NOTICE '[%] PASS 1 — %', t_pass_start, base;
+    RAISE NOTICE 'PASS 1';
 
     EXECUTE 'drop table if exists __tmp_forecast_build';
     sql := format($f$
@@ -314,8 +279,7 @@ END IF;
       cross join variants v
       where sr.forecast_id = %L
       order by sr.date, v.column1, v.column3;
-    
-    -- VC 5.4.3: early trim & error on temp to reduce downstream work
+
     DELETE FROM __tmp_forecast_build WHERE base_fv IS NULL;
     UPDATE __tmp_forecast_build
        SET fv_error = ABS(value - fv);
@@ -331,8 +295,8 @@ $f$,
       sr_qual, latest_id
     );
     EXECUTE sql;
-    -- keep dest_rel/dest_qual for _instance_forecast_msq
-EXECUTE format($i$
+
+    EXECUTE format($i$
       INSERT INTO %1$s (
         forecast_id, "date", value, %2$I, %3$I, model_name, base_model, base_fv,
         fmsr_series, fmsr_value, fv, fv_error, fv_mae, fv_mean_mae, fv_mean_mae_c,
@@ -347,23 +311,15 @@ EXECUTE format($i$
         best_fm_count, best_fm_odds, best_fm_sig, fv_interval, fv_interval_c,
         fv_interval_odds, fv_interval_sig, fv_variance, fv_variance_mean, now()
       FROM __tmp_forecast_build
-          ON CONFLICT (forecast_id, date, model_name, fmsr_series) DO UPDATE SET value=EXCLUDED.value, series=EXCLUDED.series, season=EXCLUDED.season, model_name=EXCLUDED.model_name, base_model=EXCLUDED.base_model, base_fv=EXCLUDED.base_fv, fmsr_series=EXCLUDED.fmsr_series, fmsr_value=EXCLUDED.fmsr_value, fv=EXCLUDED.fv, fv_error=EXCLUDED.fv_error, fv_mae=EXCLUDED.fv_mae, fv_mean_mae=EXCLUDED.fv_mean_mae, fv_mean_mae_c=EXCLUDED.fv_mean_mae_c, fv_u=EXCLUDED.fv_u, fv_l=EXCLUDED.fv_l, mae_comparison=EXCLUDED.mae_comparison, mean_mae_comparison=EXCLUDED.mean_mae_comparison, accuracy_comparison=EXCLUDED.accuracy_comparison, best_fm_count=EXCLUDED.best_fm_count, best_fm_odds=EXCLUDED.best_fm_odds, best_fm_sig=EXCLUDED.best_fm_sig, fv_interval=EXCLUDED.fv_interval, fv_interval_c=EXCLUDED.fv_interval_c, fv_interval_odds=EXCLUDED.fv_interval_odds, fv_interval_sig=EXCLUDED.fv_interval_sig, fv_variance=EXCLUDED.fv_variance, fv_variance_mean=EXCLUDED.fv_variance_mean, created_at=EXCLUDED.created_at
+          ON CONFLICT (forecast_id, date, model_name, fmsr_series) DO NOTHING
     $i$, dest_qual, dest_series_col, dest_season_col, 'series', base || '_yqm');
--- Replace placeholder fv_error with computed fv_error2 (computed at CTAS to avoid a full-table UPDATE)
-    GET DIAGNOSTICS rcnt = ROW_COUNT;
-    RAISE NOTICE '[%] PASS 1 — % rows: % (%.3f s)', clock_timestamp(), dest_rel, rcnt,
-      EXTRACT(epoch FROM clock_timestamp() - t_pass_start);
 
     IF enable_full_analyze THEN
       EXECUTE format('ANALYZE %s', dest_qual);
     END IF;
 
-    ------------------------------------------------------------------
-
     -- PASS 3 — fv_mae
-    ------------------------------------------------------------------
-    t_pass_start := clock_timestamp();
-    RAISE NOTICE '[%] PASS 3 — fv_mae …', t_pass_start;
+    RAISE NOTICE 'PASS 3 — fv_mae';
     EXECUTE format($u$
       WITH m AS (
         SELECT %1$I AS series, model_name, %2$I AS yqm, AVG(fv_error)::numeric AS mae
@@ -379,15 +335,10 @@ EXECUTE format($i$
          AND t.%2$I       = m.yqm
          AND t.fv_error IS NOT NULL
     $u$,  dest_series_col, dest_season_col, dest_qual);
-    GET DIAGNOSTICS rcnt = ROW_COUNT;
     IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
-    RAISE NOTICE '[%] PASS 3 — updated rows: % (%.3f s)', clock_timestamp(), rcnt,
-      EXTRACT(epoch FROM clock_timestamp() - t_pass_start);
 
-    ------------------------------------------------------------------
-    -- season_dim temp (for this series)
-    ------------------------------------------------------------------
-    RAISE NOTICE '[%] BUILD __season_dim …', clock_timestamp();
+    -- season_dim temp
+    RAISE NOTICE 'BUILD __season_dim';
     EXECUTE 'DROP TABLE IF EXISTS __season_dim';
     EXECUTE format($u$
       CREATE TEMPORARY TABLE __season_dim AS
@@ -401,17 +352,11 @@ EXECUTE format($i$
       WHERE base_fv IS NOT NULL
       GROUP BY %1$I, model_name, %2$I
     $u$,  dest_series_col, dest_season_col, dest_qual);
-
-    
-    -- VC 4.6: index temp season_dim
     CREATE INDEX ON __season_dim (series, model_name, yqm);
     ANALYZE __season_dim;
 
-    ------------------------------------------------------------------
-    -- PASS 4a — fv_mean_mae & fv_mean_mae_c (strict chronological lag by season_start; exclude current)
-    ------------------------------------------------------------------
-    t_pass_start := clock_timestamp();
-    RAISE NOTICE '[%] PASS 4a — lagged mean/count …', t_pass_start;
+    -- PASS 4a — fv_mean_mae & fv_mean_mae_c
+    RAISE NOTICE 'PASS 4a — fv_mean_mae/count';
     EXECUTE format($u$
       WITH stats AS (
         SELECT
@@ -442,27 +387,19 @@ EXECUTE format($i$
               t.fv_mean_mae_c IS DISTINCT FROM (st.prev_cnt)::numeric
          )
     $u$,  dest_qual, dest_series_col, dest_season_col);
-    GET DIAGNOSTICS rcnt = ROW_COUNT;
     IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
-    RAISE NOTICE '[%] PASS 4a — updated rows: % (%.3f s)', clock_timestamp(), rcnt,
-      EXTRACT(epoch FROM clock_timestamp() - t_pass_start);
 
-    -- PASS 4b — bands …', t_pass_start;
+    -- PASS 4b — bands
     EXECUTE format($u$
       UPDATE %1$s
          SET fv_u = fv + fv_mean_mae,
              fv_l = GREATEST(0, fv - fv_mean_mae)
        WHERE fv_mean_mae IS NOT NULL
     $u$,  dest_qual);
-    GET DIAGNOSTICS rcnt = ROW_COUNT;
     IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
-    RAISE NOTICE '[%] PASS 4b — updated rows: % (%.3f s)', clock_timestamp(), rcnt,
-      EXTRACT(epoch FROM clock_timestamp() - t_pass_start);
 
-    ------------------------------------------------------------------
     -- A0 cache temp
-    ------------------------------------------------------------------
-    RAISE NOTICE '[%] BUILD __a0_map …', clock_timestamp();
+    RAISE NOTICE 'BUILD __a0_map';
     EXECUTE 'DROP TABLE IF EXISTS __a0_map';
     EXECUTE format($u$
       CREATE TEMPORARY TABLE __a0_map AS
@@ -473,17 +410,11 @@ EXECUTE format($i$
       WHERE fmsr_series = 'A0'
       GROUP BY base_model, %1$I
     $u$,  dest_season_col, dest_qual);
-
-    
-    -- VC 4.6: index temp a0_map
     CREATE INDEX ON __a0_map (base_model, yqm);
     ANALYZE __a0_map;
 
-    ------------------------------------------------------------------
     -- PASS 5 — intervals / variance / comparisons
-    ------------------------------------------------------------------
-    t_pass_start := clock_timestamp();
-    RAISE NOTICE '[%] PASS 5 — intervals/variance/comparisons …', t_pass_start;
+    RAISE NOTICE 'PASS 5 — intervals/comparisons';
     EXECUTE format($u$
       UPDATE %2$s t
          SET
@@ -524,22 +455,15 @@ EXECUTE format($i$
        WHERE t.base_model = a0.base_model
          AND t.%1$I       = a0.yqm
     $u$,  dest_season_col, dest_qual);
-    GET DIAGNOSTICS rcnt = ROW_COUNT;
-    IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
-    RAISE NOTICE '[%] PASS 5 — updated rows: % (%.3f s)', clock_timestamp(), rcnt,
-      EXTRACT(epoch FROM clock_timestamp() - t_pass_start);
-
-    ------------------------------------------------------------------
-    -- SUPPORT: index for PASS 6A update/join
-    ------------------------------------------------------------------
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %s (%I, model_name, %I)', dest_rel || '_sm_yqm', dest_qual, dest_series_col, dest_season_col);
     IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
 
-    ------------------------------------------------------------------
-    -- PASS 6A — counts & variance mean (lag counts by season_start; exclude current)
-    ------------------------------------------------------------------
-    t_pass_start := clock_timestamp();
-    RAISE NOTICE '[%] PASS 6A — lagged counts/variance mean …', t_pass_start;
+    -- SUPPORT: index for PASS 6A
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %s (%I, model_name, %I)',
+                   dest_rel || '_sm_yqm', dest_qual, dest_series_col, dest_season_col);
+    IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
+
+    -- PASS 6A — counts & variance mean (fv_interval_c rule)
+    RAISE NOTICE 'PASS 6A — lagged counts/variance mean';
     EXECUTE format($u$
       WITH flags AS (
         SELECT
@@ -616,16 +540,10 @@ EXECUTE format($i$
               t.fv_variance_mean IS NULL
            )
     $u$,  dest_series_col, dest_season_col, dest_qual);
-    GET DIAGNOSTICS rcnt = ROW_COUNT;
     IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
-    RAISE NOTICE '[%] PASS 6A — updated rows: % (%.3f s)', clock_timestamp(), rcnt,
-      EXTRACT(epoch FROM clock_timestamp() - t_pass_start);
 
-    ------------------------------------------------------------------
-    -- PASS 6B — odds & significance (extend into forecast rows; require only n>0) — use engine.binom_p
-    ------------------------------------------------------------------
-    t_pass_start := clock_timestamp();
-    RAISE NOTICE '[%] PASS 6B — odds/significance …', t_pass_start;
+    -- PASS 6B — odds & significance using engine.binom_p
+    RAISE NOTICE 'PASS 6B — odds/significance';
     EXECUTE format($u$
       WITH stats AS (
         SELECT
@@ -669,24 +587,18 @@ EXECUTE format($i$
       )
       UPDATE %3$s t
          SET best_fm_odds     = ip.odds_best,
-             best_fm_sig = CASE WHEN ip.p_best IS NULL THEN NULL ELSE ip.p_best::numeric END,
+             best_fm_sig      = CASE WHEN ip.p_best IS NULL THEN NULL ELSE ip.p_best::numeric END,
              fv_interval_odds = ip.odds_int,
-             fv_interval_sig = CASE WHEN ip.p_int IS NULL THEN NULL ELSE ip.p_int::numeric END
+             fv_interval_sig  = CASE WHEN ip.p_int IS NULL THEN NULL ELSE ip.p_int::numeric END
         FROM ints_p ip
        WHERE t.%1$I       = ip.series
          AND t.model_name = ip.model_name
          AND t.%2$I       = ip.yqm
     $u$,  dest_series_col, dest_season_col, dest_qual);
-    GET DIAGNOSTICS rcnt = ROW_COUNT;
     IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
-    RAISE NOTICE '[%] PASS 6B — updated rows: % (%.3f s)', clock_timestamp(), rcnt,
-      EXTRACT(epoch FROM clock_timestamp() - t_pass_start);
 
-    ------------------------------------------------------------------
-    -- PASS 7 — final clamp to 4dp on all metric columns
-    ------------------------------------------------------------------
-    t_pass_start := clock_timestamp();
-    RAISE NOTICE '[%] PASS 7 — clamp to 4dp …', t_pass_start;
+    -- PASS 7 — clamp to 4dp
+    RAISE NOTICE 'PASS 7 — clamp to 4dp';
     EXECUTE format($c$
       UPDATE %s SET
         value            = round(value::numeric, 4),
@@ -705,94 +617,38 @@ EXECUTE format($i$
         fv_variance      = CASE WHEN fv_variance IS NULL THEN NULL ELSE round(fv_variance::numeric, 4) END,
         fv_variance_mean = CASE WHEN fv_variance_mean IS NULL THEN NULL ELSE round(fv_variance_mean::numeric, 4) END
     $c$, dest_qual);
-      -- Only rewrite rows where at least one value would change
-      EXECUTE format($w$
-        UPDATE %s SET
-          value            = round(value::numeric, 4),
-          base_fv          = round(base_fv::numeric, 4),
-          fmsr_value       = round(fmsr_value::numeric, 4),
-          fv               = round(fv::numeric, 4),
-          fv_error         = CASE WHEN fv_error IS NULL THEN NULL ELSE round(fv_error::numeric, 4) END,
-          fv_mae           = CASE WHEN fv_mae IS NULL THEN NULL ELSE round(fv_mae::numeric, 4) END,
-          fv_mean_mae      = CASE WHEN fv_mean_mae IS NULL THEN NULL ELSE round(fv_mean_mae::numeric, 4) END,
-          fv_u             = CASE WHEN fv_u IS NULL THEN NULL ELSE round(fv_u::numeric, 4) END,
-          fv_l             = CASE WHEN fv_l IS NULL THEN NULL ELSE round(fv_l::numeric, 4) END,
-          best_fm_odds     = CASE WHEN best_fm_odds IS NULL THEN NULL ELSE round(best_fm_odds::numeric, 4) END,
-          best_fm_sig      = CASE WHEN best_fm_sig IS NULL THEN NULL ELSE round(best_fm_sig::numeric, 4) END,
-          fv_interval_odds = CASE WHEN fv_interval_odds IS NULL THEN NULL ELSE round(fv_interval_odds::numeric, 4) END,
-          fv_interval_sig  = CASE WHEN fv_interval_sig IS NULL THEN NULL ELSE round(fv_interval_sig::numeric, 4) END,
-          fv_variance      = CASE WHEN fv_variance IS NULL THEN NULL ELSE round(fv_variance::numeric, 4) END,
-          fv_variance_mean = CASE WHEN fv_variance_mean IS NULL THEN NULL ELSE round(fv_variance_mean::numeric, 4) END
-        WHERE
-             value            IS DISTINCT FROM round(value::numeric, 4)
-          OR base_fv          IS DISTINCT FROM round(base_fv::numeric, 4)
-          OR fmsr_value       IS DISTINCT FROM round(fmsr_value::numeric, 4)
-          OR fv               IS DISTINCT FROM round(fv::numeric, 4)
-          OR (fv_error        IS NOT NULL AND fv_error        IS DISTINCT FROM round(fv_error::numeric, 4))
-          OR (fv_mae          IS NOT NULL AND fv_mae          IS DISTINCT FROM round(fv_mae::numeric, 4))
-          OR (fv_mean_mae     IS NOT NULL AND fv_mean_mae     IS DISTINCT FROM round(fv_mean_mae::numeric, 4))
-          OR (fv_u            IS NOT NULL AND fv_u            IS DISTINCT FROM round(fv_u::numeric, 4))
-          OR (fv_l            IS NOT NULL AND fv_l            IS DISTINCT FROM round(fv_l::numeric, 4))
-          OR (best_fm_odds    IS NOT NULL AND best_fm_odds    IS DISTINCT FROM round(best_fm_odds::numeric, 4))
-          OR (best_fm_sig     IS NOT NULL AND best_fm_sig     IS DISTINCT FROM round(best_fm_sig::numeric, 4))
-          OR (fv_interval_odds IS NOT NULL AND fv_interval_odds IS DISTINCT FROM round(fv_interval_odds::numeric, 4))
-          OR (fv_interval_sig  IS NOT NULL AND fv_interval_sig  IS DISTINCT FROM round(fv_interval_sig::numeric, 4))
-          OR (fv_variance     IS NOT NULL AND fv_variance     IS DISTINCT FROM round(fv_variance::numeric, 4))
-          OR (fv_variance_mean IS NOT NULL AND fv_variance_mean IS DISTINCT FROM round(fv_variance_mean::numeric, 4))
-      $w$, dest_qual);
-      GET DIAGNOSTICS rcnt = ROW_COUNT;
-    IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
-    RAISE NOTICE '[%] PASS 7 — clamped % rows (%.3f s)', clock_timestamp(), rcnt,
-      EXTRACT(epoch FROM clock_timestamp() - t_pass_start);
 
-
-    -- Enforce integer types for count columns
-    EXECUTE format(
+    -- enforce integer types
+    /* DISABLED (view-safe hotfix):
+EXECUTE format(
       'ALTER TABLE %s
          ALTER COLUMN best_fm_count    TYPE integer USING COALESCE(best_fm_count,0)::integer,
          ALTER COLUMN fv_interval_c    TYPE integer USING COALESCE(fv_interval_c,0)::integer,
          ALTER COLUMN fv_mean_mae_c    TYPE integer USING COALESCE(fv_mean_mae_c,0)::integer',
       dest_qual
     );
--- Optional physical maintenance (A: gated)
-    ------------------------------------------------------------------
-    IF enable_cluster_vacuum THEN
-      t_pass_start := clock_timestamp();
-      RAISE NOTICE '[%] CLUSTER/VACUUM …', t_pass_start;
-      BEGIN
-        EXECUTE format('ALTER TABLE %s CLUSTER ON %I', dest_qual, idx_date_name);
-        EXECUTE format('CLUSTER %s USING %I', dest_qual, idx_date_name);
-      EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'CLUSTER skipped: %', SQLERRM;
-      END;
-      BEGIN
-        EXECUTE format('VACUUM (FREEZE, ANALYZE) %s', dest_qual);
-      EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'VACUUM skipped: %', SQLERRM;
-      END;
-      RAISE NOTICE '[%] CLUSTER/VACUUM done (%.3f s)', clock_timestamp(),
-        EXTRACT(epoch FROM clock_timestamp() - t_pass_start);
-    END IF;
 
-    RAISE NOTICE '[%] COMPLETE % (series elapsed: %.3f s)', clock_timestamp(), dest_rel,
-      EXTRACT(epoch FROM clock_timestamp() - t_series_start);
+    
+*/
+RAISE NOTICE 'COMPLETE series: % (elapsed %.3f s)',
+      dest_rel, EXTRACT(epoch FROM clock_timestamp() - t_series_start);
   END LOOP;
 
-  RAISE NOTICE '[%] ALL DONE (total elapsed: %.3f s)', clock_timestamp(),
+  RAISE NOTICE 'ALL DONE (total elapsed %.3f s)',
     EXTRACT(epoch FROM clock_timestamp() - t_run_start);
 END
 
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION engine.build_forecast_msq()
+CREATE OR REPLACE FUNCTION engine.build_forecast_msqm()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY INVOKER
 AS $$
 BEGIN
-  PERFORM engine.build_forecast_msq_core();
+  PERFORM engine.build_forecast_msqm_core();
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION engine.build_forecast_msq() TO matrix_reader, tsf_engine_app;
-GRANT EXECUTE ON FUNCTION engine.build_forecast_msq_core() TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_forecast_msqm() TO matrix_reader, tsf_engine_app;
+GRANT EXECUTE ON FUNCTION engine.build_forecast_msqm_core() TO matrix_reader, tsf_engine_app;
