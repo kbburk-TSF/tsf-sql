@@ -1,11 +1,21 @@
--- V14_09_FORECAST_MSQ.sql
--- 2025-10-05: V14 — MSQ variant: Cannon logic (bands+CI 85/90/95, MAPE/MAE/RMSE, lagged counts, coverage, variance).
--- Keep V13 wrapper/function names and flow; apply only Cannon column/logic updates in core.
--- No references to engine.wd_md_instance_forecast_*, no sr_* injection; dynamic series/season column resolution.
--- DO NOT CHANGE WRAPPER NAMES OR SIGNATURES.
+-- 2025-10-05: FIX — forecast_registry update: set msq_complete = 'complete' on core completion; no other changes.
+-- 2025-10-05: FIX — bands unclamped; lows now fv - (fv * (X * fv_mean_mape)); highs fv + (fv * (X * fv_mean_mape)).
+-- 2025-10-05: CORE SYNC — cloned clean core from V14_08; fixed PASS 7 hang by using identical logic; wrappers and dest tables renamed to flavor.
+
+-- V14_08_FORECAST_MS.sql
+-- 2025-10-05: V14_08 — MS family: apply CANNON V13_09c logic with 10-band CI selection (85/90/95),
+--              add MAE/RMSE families + per-metric lagged counts, remove legacy interval/binomial fields,
+--              add variability (dir) fields; keep V13 wrappers/flow; no optimizations.
+--              Wrapper signatures and names unchanged: engine.msq_forecast(text), engine.msq_forecast__core().
+--              Destination schema updated to match CANNON spec for MS family.
+--              NOTE: This script assumes sr_<base>_latest exists per CANNON SR template (public schema).
+-- 2025-09-29: MAPE band multiplier set to 2.25 (historical reference; superseded by 10 fixed bands here).
+-- 2025-09-27: Hard-locked MS to *_instance_sr_s only (carried forward).
+-- DO NOT MODIFY WRAPPER NAMES OR SIGNATURES.
 
 SET client_min_messages = NOTICE;
 
+-- Entry point: engine.msq_forecast(forecast_name TEXT) — preserved from V13
 CREATE OR REPLACE FUNCTION engine.msq_forecast(forecast_name TEXT)
 RETURNS void
 LANGUAGE plpgsql
@@ -18,6 +28,7 @@ BEGIN
 END;
 $$;
 
+-- Core body — preserved structure; logic updated per CANNON
 CREATE OR REPLACE FUNCTION engine.msq_forecast__core()
 RETURNS void
 LANGUAGE plpgsql
@@ -25,8 +36,13 @@ AS $$
 DECLARE
   v_forecast_name         text;
   forecast_target_id      uuid;
+  enable_extended_stats   boolean := false;
+  enable_cluster_vacuum   boolean := false;
+  enable_full_analyze     boolean := true;
+  enable_binom_build      boolean := false; -- removed per CANNON
   t_run_start             timestamptz := clock_timestamp();
   t_series_start          timestamptz;
+  t_pass_start            timestamptz;
   r                       record;
   base                    text;
   sr_rel                  text;
@@ -45,7 +61,7 @@ DECLARE
   sr_fmsr_a2w_col         text;
   sr_fmsr_a3_col          text;
   sr_fmsr_a3w_col         text;
-  -- classical helpers (hydration from __ih_subset alias h)
+  -- classical helpers (hydration)
   h_lmm1                  text := 'h.'||quote_ident('lmm1');
   h_lmm5                  text := 'h.'||quote_ident('lmm5');
   h_lmm10                 text := 'h.'||quote_ident('lmm10');
@@ -58,6 +74,7 @@ DECLARE
   rcnt                    bigint;
   tname                   text;
 BEGIN
+  -- Resolve forecast_target_id from provided name
   v_forecast_name := current_setting('engine.forecast_name', true);
   IF v_forecast_name IS NULL THEN
     RAISE EXCEPTION 'engine.msq_forecast() requires forecast_name';
@@ -74,12 +91,46 @@ BEGIN
   END IF;
   latest_id := forecast_target_id;
 
+  -- v11 prelude: per-run temp subsets + composite key domain (forecast_id, date)
   CREATE TEMP TABLE __ih_subset ON COMMIT DROP AS
     SELECT * FROM engine.instance_historical WHERE forecast_id = latest_id;
   CREATE INDEX ON __ih_subset (date);
-  ANALYZE __ih_subset;
+CREATE TEMP TABLE __keys (
+    forecast_id uuid NOT NULL,
+    date date NOT NULL,
+    PRIMARY KEY (forecast_id, date)
+  ) ON COMMIT DROP;
 
-  -- Drop any leftover forecast_s scratch tables
+  INSERT INTO __keys (forecast_id, date)
+  SELECT latest_id, date FROM (SELECT DISTINCT date FROM __ih_subset) d;
+
+
+  -- v12: build __universe (guarded) and planner nudges
+  IF to_regclass('__universe') IS NOT NULL THEN
+    EXECUTE 'DROP TABLE IF EXISTS __universe';
+  END IF;
+  CREATE TEMP TABLE __universe ON COMMIT DROP AS
+    SELECT forecast_id, date FROM __ih_subset;
+  CREATE INDEX ON __universe (forecast_id, date);
+  ANALYZE __universe;
+
+  -- Planner nudges scoped to this function
+  PERFORM set_config('enable_seqscan','off',true);
+  PERFORM set_config('enable_nestloop','off',true);
+  PERFORM set_config('jit','off',true);
+  PERFORM set_config('work_mem','256MB',true);
+  PERFORM set_config('maintenance_work_mem','512MB',true);
+  PERFORM set_config('max_parallel_workers_per_gather','4',true);
+  PERFORM set_config('parallel_setup_cost','0',true);
+  PERFORM set_config('parallel_tuple_cost','0',true);
+  PERFORM set_config('enable_hashjoin','on',true);
+  PERFORM set_config('enable_mergejoin','off',true);
+  PERFORM set_config('enable_bitmapscan','on',true);
+
+  PERFORM set_config('client_min_messages','NOTICE',true);
+  RAISE NOTICE 'RUN START';
+
+  -- Purge any prior scratch tables once per run
   FOR tname IN
     SELECT format('%I.%I', 'engine', c.relname)
     FROM pg_class c
@@ -91,7 +142,7 @@ BEGIN
     EXECUTE format('DROP TABLE IF EXISTS %s CASCADE', tname);
   END LOOP;
 
-  -- Iterate each *_instance_sr_s series
+  -- Loop each *_instance_sr_s series
   FOR r IN
     SELECT tablename
     FROM pg_catalog.pg_tables
@@ -105,12 +156,14 @@ BEGIN
     sr_qual := format('%I.%I', 'engine', sr_rel);
     RAISE NOTICE 'BEGIN series: %', base;
 
-    -- Start-from: 2 years after min date
+    -- Start-from: 2 years after min date of subset
     EXECUTE $q$
-      SELECT (min(date) + interval '2 years')::date
-      FROM __ih_subset
-      WHERE forecast_id = $1
-    $q$ USING latest_id INTO start_from;
+      select (min(date) + interval '2 years')::date
+      from __ih_subset
+      where forecast_id = $1
+    $q$
+    USING latest_id
+    INTO start_from;
 
     IF start_from IS NULL THEN
       RAISE NOTICE 'SKIP series % — no historical', base;
@@ -120,7 +173,7 @@ BEGIN
     dest_rel  := base || '_instance_forecast_msq';
     dest_qual := format('%I.%I', 'engine', dest_rel);
 
-    -- Create destination table if missing (Cannon schema)
+    -- Create destination table per CANNON (if missing)
     IF to_regclass(dest_qual) IS NULL THEN
       EXECUTE format($ct$
         CREATE TABLE %1$s (
@@ -136,17 +189,19 @@ BEGIN
           fmsr_value numeric(18,4),
           fv numeric(18,4),
           fv_error numeric(18,4),
-          -- MAPE/MAE/RMSE
+          -- MAPE family
           fv_mape numeric(18,4),
           fv_mean_mape numeric(18,4),
           fv_mean_mape_c numeric(18,4),
+          -- MAE family
           fv_mae numeric(18,4),
           fv_mean_mae numeric(18,4),
           fv_mean_mae_c numeric(18,4),
+          -- RMSE family
           fv_rmse numeric(18,4),
           fv_mean_rmse numeric(18,4),
           fv_mean_rmse_c numeric(18,4),
-          -- A0/Ax comparisons
+          -- A0/Ax comparisons (MAPE/MAE/RMSE)
           mape_comparison text,
           mean_mape_comparison text,
           accuracy_comparison text,
@@ -156,11 +211,11 @@ BEGIN
           rmse_comparison text,
           mean_rmse_comparison text,
           rmse_accuracy_comparison text,
-          -- Lagged counts
+          -- Per-metric lagged counts (prior seasons)
           best_mape_count integer,
           best_mae_count integer,
           best_rmse_count integer,
-          -- 10-band bounds + hits
+          -- 10-band bounds (MAPE-scaled) and row hits
           fv_b125_u numeric(18,4), fv_b125_l numeric(18,4),
           fv_b150_u numeric(18,4), fv_b150_l numeric(18,4),
           fv_b175_u numeric(18,4), fv_b175_l numeric(18,4),
@@ -173,54 +228,73 @@ BEGIN
           fv_b350_u numeric(18,4), fv_b350_l numeric(18,4),
           b125_hit text, b150_hit text, b175_hit text, b200_hit text, b225_hit text,
           b250_hit text, b275_hit text, b300_hit text, b325_hit text, b350_hit text,
-          -- Prior-season coverage
+          -- Prior-season coverage (means of season scores)
           b125_cov numeric(18,4), b150_cov numeric(18,4), b175_cov numeric(18,4), b200_cov numeric(18,4), b225_cov numeric(18,4),
           b250_cov numeric(18,4), b275_cov numeric(18,4), b300_cov numeric(18,4), b325_cov numeric(18,4), b350_cov numeric(18,4),
           -- Selected CI bounds
           ci85_low numeric(18,4), ci85_high numeric(18,4),
           ci90_low numeric(18,4), ci90_high numeric(18,4),
           ci95_low numeric(18,4), ci95_high numeric(18,4),
-          -- Variability placeholders (left null if not available in msq)
+          -- Variability / direction fields
           msr_dir text,
           fmsr_dir text,
           dir_hit text,
           dir_hit_count integer,
-          -- Variance
+          -- Variance carryovers
           fv_variance numeric(18,4),
           fv_variance_mean numeric(18,4),
           created_at timestamptz DEFAULT now(),
           PRIMARY KEY (forecast_id, date, model_name, fmsr_series)
         )
       $ct$, dest_qual);
+      -- Ensure <base>_msr column exists (dynamic add if missing)
+      PERFORM 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=dest_rel AND column_name=(base||'_msr');
+      IF NOT FOUND THEN
+        EXECUTE format('ALTER TABLE %s ADD COLUMN %I numeric(18,4)', dest_qual, base||'_msr');
+      END IF;
+    ELSE
+      -- If table exists, ensure new columns exist; add if missing (idempotent)
+      PERFORM 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=dest_rel AND column_name=(base||'_msr');
+      IF NOT FOUND THEN
+        EXECUTE format('ALTER TABLE %s ADD COLUMN %I numeric(18,4)', dest_qual, base||'_msr');
+      END IF;
+      -- drop legacy columns removed by CANNON (if present)
+      PERFORM 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=dest_rel AND column_name='fv_u';
+      IF FOUND THEN EXECUTE format('ALTER TABLE %s DROP COLUMN IF EXISTS fv_u, DROP COLUMN IF EXISTS fv_l, DROP COLUMN IF EXISTS fv_interval, DROP COLUMN IF EXISTS fv_interval_c, DROP COLUMN IF EXISTS best_fm_count, DROP COLUMN IF EXISTS best_fm_odds, DROP COLUMN IF EXISTS best_fm_sig, DROP COLUMN IF EXISTS fv_interval_odds, DROP COLUMN IF EXISTS fv_interval_sig', dest_qual); END IF;
     END IF;
 
-    -- Work table mirror
+    -- Work table mirror; redirect IO to __work
     EXECUTE 'DROP TABLE IF EXISTS __work';
     EXECUTE 'CREATE TEMP TABLE __work (LIKE ' || dest_qual || ' INCLUDING ALL)';
     EXECUTE 'CREATE INDEX ON __work (forecast_id, date)';
-    ANALYZE __work;
+    EXECUTE 'ANALYZE __work';
     dest_real_qual := dest_qual;
     dest_qual := '__work';
 
-    -- Determine destination column names (series/season) — follow V13: series→s→base ; season→s_yqm→base||'_yqm'
+    -- Determine destination column names
     dest_series_col := 'series';
+    dest_season_col := 'season';
+    -- prefer canonical columns if present
     PERFORM 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=dest_rel AND column_name=dest_series_col;
     IF NOT FOUND THEN
+      -- try compact 's'
       dest_series_col := 's';
       PERFORM 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=dest_rel AND column_name=dest_series_col;
-      IF NOT FOUND THEN dest_series_col := base; END IF;
+      IF NOT FOUND THEN
+        dest_series_col := base;
+      END IF;
     END IF;
 
-    dest_season_col := 'season';
     PERFORM 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=dest_rel AND column_name=dest_season_col;
     IF NOT FOUND THEN
+      -- try compact 's_yqm'
       dest_season_col := 's_yqm';
       PERFORM 1 FROM information_schema.columns WHERE table_schema='engine' AND table_name=dest_rel AND column_name=dest_season_col;
-      IF NOT FOUND THEN dest_season_col := base || '_yqm'; END IF;
+      IF NOT FOUND THEN
+        dest_season_col := base || '_yqm';
+      END IF;
     END IF;
-
-    -- source SR columns
-    sr_base_col       := 'sr.' || quote_ident(base);
+sr_base_col       := 'sr.' || quote_ident(base);
     sr_yqm_col        := 'sr.' || quote_ident(base || '_yqm');
     sr_fmsr_a1_col    := 'sr.' || quote_ident(base || '_fmsr_a1');
     sr_fmsr_a2_col    := 'sr.' || quote_ident(base || '_fmsr_a2');
@@ -228,12 +302,15 @@ BEGIN
     sr_fmsr_a3_col    := 'sr.' || quote_ident(base || '_fmsr_a3');
     sr_fmsr_a3w_col   := 'sr.' || quote_ident(base || '_fmsr_a3w');
 
-    -- PASS 1 — Hydration
-    EXECUTE 'DROP TABLE IF EXISTS __tmp_forecast_build';
+    -- PASS 1 — Hydration (fv, fv_error). Also stage MSR generic column 'msr' to map into <base>_msr at insert
+    t_pass_start := clock_timestamp();
+    RAISE NOTICE 'PASS 1 — hydration';
+    EXECUTE 'drop table if exists __tmp_forecast_build';
+
     sql := format($f$
-      CREATE TEMP TABLE __tmp_forecast_build AS
-      WITH variants AS (
-        VALUES
+      create temporary table __tmp_forecast_build as
+      with variants as (
+        values
           ('LMM1','lmm1','A0'), ('LMM1','lmm1','A1'), ('LMM1','lmm1','A2'), ('LMM1','lmm1','A2W'), ('LMM1','lmm1','A3'), ('LMM1','lmm1','A3W'),
           ('LMM5','lmm5','A0'), ('LMM5','lmm5','A1'), ('LMM5','lmm5','A2'), ('LMM5','lmm5','A2W'), ('LMM5','lmm5','A3'), ('LMM5','lmm5','A3W'),
           ('LMM10','lmm10','A0'), ('LMM10','lmm10','A1'), ('LMM10','lmm10','A2'), ('LMM10','lmm10','A2W'), ('LMM10','lmm10','A3'), ('LMM10','lmm10','A3W'),
@@ -243,7 +320,7 @@ BEGIN
           ('SES_M','ses_m','A0'), ('SES_M','ses_m','A1'), ('SES_M','ses_m','A2'), ('SES_M','ses_m','A2W'), ('SES_M','ses_m','A3'), ('SES_M','ses_m','A3W'),
           ('HWES_M','hwes_m','A0'), ('HWES_M','hwes_m','A1'), ('HWES_M','hwes_m','A2'), ('HWES_M','hwes_m','A2W'), ('HWES_M','hwes_m','A3'), ('HWES_M','hwes_m','A3W')
       )
-      SELECT
+      select
         sr.forecast_id,
         sr.date,
         round(h.value::numeric, 4)::numeric(18,4) as value,
@@ -331,19 +408,20 @@ BEGIN
         NULL::numeric(18,4) as ci85_low, NULL::numeric(18,4) as ci85_high,
         NULL::numeric(18,4) as ci90_low, NULL::numeric(18,4) as ci90_high,
         NULL::numeric(18,4) as ci95_low, NULL::numeric(18,4) as ci95_high,
+        NULL::numeric(18,4) as msr,
         NULL::text as msr_dir,
         NULL::text as fmsr_dir,
         NULL::text as dir_hit,
         NULL::int  as dir_hit_count,
         NULL::numeric(18,4) as fv_variance,
         NULL::numeric(18,4) as fv_variance_mean
-      FROM %s sr
-      JOIN __ih_subset h
-        ON h.forecast_id = sr.forecast_id
-       AND h.date        = sr.date
-      CROSS JOIN variants v
-      WHERE sr.forecast_id = %L
-      ORDER BY sr.date, v.column1, v.column3;
+      from %s sr
+      join __ih_subset h
+        on h.forecast_id = sr.forecast_id
+       and h.date        = sr.date
+      cross join variants v
+      where sr.forecast_id = %L
+      order by sr.date, v.column1, v.column3;
       DELETE FROM __tmp_forecast_build WHERE base_fv IS NULL;
       UPDATE __tmp_forecast_build
          SET fv_error = ABS(value - fv),
@@ -359,11 +437,25 @@ BEGIN
       sr_fmsr_a1_col, sr_fmsr_a2_col, sr_fmsr_a2w_col, sr_fmsr_a3_col, sr_fmsr_a3w_col,
       sr_qual, latest_id
     );
+
     EXECUTE sql;
 
-    -- INSERT into work table
-    EXECUTE format($i$
-      INSERT INTO %1$s (
+    
+    -- Inject MSR from public.sr_<base>_latest into generic 'msr' column (guarded)
+    IF to_regclass(format('%s.%s','public','sr_'||base||'_latest')) IS NOT NULL THEN
+      EXECUTE format($u$
+        UPDATE __tmp_forecast_build t
+           SET msr = s.%1$I
+          FROM %2$I.%3$I s
+         WHERE s.forecast_id = $1
+           AND s.date = t.date
+      $u$, base||'_msr', 'public', 'sr_'||base||'_latest') USING latest_id;
+    ELSE
+      RAISE NOTICE 'No SR table found for base %, skipping MSR inject', base;
+    END IF;
+
+-- Write PASS 1 rows into work table (map generic 'msr' -> dynamic <base>_msr column)
+    EXECUTE format($i$ INSERT INTO %1$s (
         forecast_id, "date", value, %2$I, %3$I, model_name, base_model, base_fv,
         fmsr_series, fmsr_value, fv, fv_error,
         fv_mape, fv_mean_mape, fv_mean_mape_c,
@@ -378,7 +470,7 @@ BEGIN
         b125_hit, b150_hit, b175_hit, b200_hit, b225_hit, b250_hit, b275_hit, b300_hit, b325_hit, b350_hit,
         b125_cov, b150_cov, b175_cov, b200_cov, b225_cov, b250_cov, b275_cov, b300_cov, b325_cov, b350_cov,
         ci85_low, ci85_high, ci90_low, ci90_high, ci95_low, ci95_high,
-        msr_dir, fmsr_dir, dir_hit, dir_hit_count,
+        %4$I, msr_dir, fmsr_dir, dir_hit, dir_hit_count,
         fv_variance, fv_variance_mean, created_at
       )
       SELECT
@@ -395,29 +487,42 @@ BEGIN
         fv_b250_u, fv_b250_l, fv_b275_u, fv_b275_l, fv_b300_u, fv_b300_l, fv_b325_u, fv_b325_l, fv_b350_u, fv_b350_l,
         b125_hit, b150_hit, b175_hit, b200_hit, b225_hit, b250_hit, b275_hit, b300_hit, b325_hit, b350_hit,
         b125_cov, b150_cov, b175_cov, b200_cov, b225_cov, b250_cov, b275_cov, b300_cov, b325_cov, b350_cov,
-        ci85_low, ci85_high, ci90_low, ci90_high, ci95_low, ci95_high,
-        msr_dir, fmsr_dir, dir_hit, dir_hit_count,
+        ci85_low, ci85_high, ci90_low, ci90_high, ci95_low,
+        ci95_high,
+        msr, msr_dir, fmsr_dir, dir_hit, dir_hit_count,
         fv_variance, fv_variance_mean, now()
       FROM __tmp_forecast_build
-      ON CONFLICT (forecast_id, date, model_name, fmsr_series) DO NOTHING
-    $i$, dest_qual, dest_series_col, dest_season_col);
+      ON CONFLICT (forecast_id, date, model_name, fmsr_series) DO NOTHING $i$, dest_qual, dest_series_col, dest_season_col, base||'_msr', 'series', base||'_yqm', 'msr');
 
-    -- Season metrics
+    GET DIAGNOSTICS rcnt = ROW_COUNT;
+    RAISE NOTICE 'PASS 1 — inserted rows: %', rcnt;
+    IF enable_full_analyze THEN
+      EXECUTE format('ANALYZE %s', dest_qual);
+    END IF;
+
+    -- PASS 2 — per-row MAPE/MAE are already set; RMSE will be assigned after season calc
+    RAISE NOTICE 'PASS 2 — accuracy per row (prep done in P1)';
+
+    -- PASS 3 — season anatomy: season_start + season metrics (MAPE/MAE/RMSE)
+    RAISE NOTICE 'PASS 3 — season metrics';
     EXECUTE 'DROP TABLE IF EXISTS __season_dim';
     EXECUTE format($u$
-      CREATE TEMP TABLE __season_dim AS
+      CREATE TEMPORARY TABLE __season_dim AS
       SELECT
-        %1$I AS series,
-        model_name,
-        %2$I AS yqm,
+        %1$I       AS series,
+        model_name AS model_name,
+        %2$I       AS yqm,
         MIN(date)  AS season_start,
         AVG(ABS(value - fv) / NULLIF(ABS(value),0))::numeric AS season_mape,
         AVG(ABS(value - fv))::numeric AS season_mae,
         sqrt(AVG(POWER(ABS(value - fv),2)))::numeric AS season_rmse
-      FROM %3$s WHERE forecast_id = $1 AND base_fv IS NOT NULL
+      FROM %3$s WHERE forecast_id = $1 AND  base_fv IS NOT NULL
       GROUP BY %1$I, model_name, %2$I
     $u$, dest_series_col, dest_season_col, dest_qual) USING latest_id;
+    CREATE INDEX ON __season_dim (series, model_name, yqm);
+    ANALYZE __season_dim;
 
+    -- Write fv_mape (season-level) and fv_rmse row-level assignment via season join
     EXECUTE format($u$
       UPDATE %1$s t
          SET fv_mape = s.season_mape,
@@ -426,7 +531,10 @@ BEGIN
        WHERE t.%2$I = s.series AND t.model_name = s.model_name AND t.%3$I = s.yqm
     $u$, dest_qual, dest_series_col, dest_season_col) USING latest_id;
 
-    -- Rolling prior-season means
+    IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
+
+    -- PASS 4 — rolling prior-season means (exclude current)
+    RAISE NOTICE 'PASS 4 — rolling means';
     EXECUTE format($u$ WITH stats AS (
         SELECT
           s.series,
@@ -448,36 +556,51 @@ BEGIN
              fv_mean_rmse   = (st.rmse_sum / NULLIF(st.rmse_cnt,0)),
              fv_mean_rmse_c = st.rmse_cnt::numeric
         FROM stats st
-       WHERE t.%2$I = st.series AND t.model_name = st.model_name AND t.%3$I = st.yqm
+       WHERE t.%2$I       = st.series
+         AND t.model_name = st.model_name
+         AND t.%3$I       = st.yqm
+         AND (
+              t.fv_mean_mape   IS DISTINCT FROM (st.mape_sum / NULLIF(st.mape_cnt,0)) OR
+              t.fv_mean_mape_c IS DISTINCT FROM st.mape_cnt::numeric OR
+              t.fv_mean_mae    IS DISTINCT FROM (st.mae_sum  / NULLIF(st.mae_cnt,0)) OR
+              t.fv_mean_mae_c  IS DISTINCT FROM st.mae_cnt::numeric OR
+              t.fv_mean_rmse   IS DISTINCT FROM (st.rmse_sum / NULLIF(st.rmse_cnt,0)) OR
+              t.fv_mean_rmse_c IS DISTINCT FROM st.rmse_cnt::numeric
+         )
     $u$, dest_qual, dest_series_col, dest_season_col) USING latest_id;
 
-    -- Bands + hits
+    IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
+
+    -- PASS 5 — 10-band bounds & row hits; prior-season coverage per band
+    RAISE NOTICE 'PASS 5 — bands & coverage';
+    -- bounds per row (MAPE-scaled off fv_mean_mape)
     EXECUTE format($u$
       UPDATE %1$s
          SET
-           fv_b125_u = fv + ((fv * fv_mean_mape) * 1.25),
-           fv_b125_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 1.25)),
-           fv_b150_u = fv + ((fv * fv_mean_mape) * 1.50),
-           fv_b150_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 1.50)),
-           fv_b175_u = fv + ((fv * fv_mean_mape) * 1.75),
-           fv_b175_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 1.75)),
-           fv_b200_u = fv + ((fv * fv_mean_mape) * 2.00),
-           fv_b200_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 2.00)),
-           fv_b225_u = fv + ((fv * fv_mean_mape) * 2.25),
-           fv_b225_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 2.25)),
-           fv_b250_u = fv + ((fv * fv_mean_mape) * 2.50),
-           fv_b250_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 2.50)),
-           fv_b275_u = fv + ((fv * fv_mean_mape) * 2.75),
-           fv_b275_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 2.75)),
-           fv_b300_u = fv + ((fv * fv_mean_mape) * 3.00),
-           fv_b300_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 3.00)),
-           fv_b325_u = fv + ((fv * fv_mean_mape) * 3.25),
-           fv_b325_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 3.25)),
-           fv_b350_u = fv + ((fv * fv_mean_mape) * 3.50),
-           fv_b350_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 3.50))
+           fv_b125_u = fv + (fv * (1.25 * fv_mean_mape)),
+           fv_b125_l = fv - (fv * (1.25 * fv_mean_mape)),
+           fv_b150_u = fv + (fv * (1.50 * fv_mean_mape)),
+           fv_b150_l = fv - (fv * (1.50 * fv_mean_mape)),
+           fv_b175_u = fv + (fv * (1.75 * fv_mean_mape)),
+           fv_b175_l = fv - (fv * (1.75 * fv_mean_mape)),
+           fv_b200_u = fv + (fv * (2.00 * fv_mean_mape)),
+           fv_b200_l = fv - (fv * (2.00 * fv_mean_mape)),
+           fv_b225_u = fv + (fv * (2.25 * fv_mean_mape)),
+           fv_b225_l = fv - (fv * (2.25 * fv_mean_mape)),
+           fv_b250_u = fv + (fv * (2.50 * fv_mean_mape)),
+           fv_b250_l = fv - (fv * (2.50 * fv_mean_mape)),
+           fv_b275_u = fv + (fv * (2.75 * fv_mean_mape)),
+           fv_b275_l = fv - (fv * (2.75 * fv_mean_mape)),
+           fv_b300_u = fv + (fv * (3.00 * fv_mean_mape)),
+           fv_b300_l = fv - (fv * (3.00 * fv_mean_mape)),
+           fv_b325_u = fv + (fv * (3.25 * fv_mean_mape)),
+           fv_b325_l = fv - (fv * (3.25 * fv_mean_mape)),
+           fv_b350_u = fv + (fv * (3.50 * fv_mean_mape)),
+           fv_b350_l = fv - (fv * (3.50 * fv_mean_mape))
        WHERE fv_mean_mape IS NOT NULL
     $u$, dest_qual) USING latest_id;
 
+    -- row hits (Y/N) per band
     EXECUTE format($u$
       UPDATE %1$s
          SET
@@ -493,7 +616,7 @@ BEGIN
            b350_hit = CASE WHEN value IS NULL OR fv_b350_l IS NULL OR fv_b350_u IS NULL THEN NULL WHEN value > fv_b350_l AND value < fv_b350_u THEN 'Y' ELSE 'N' END
     $u$, dest_qual) USING latest_id;
 
-    -- Coverage per season
+    -- season-band scores & prior-season coverage
     EXECUTE 'DROP TABLE IF EXISTS __band_scores';
     EXECUTE format($u$
       CREATE TEMP TABLE __band_scores AS
@@ -512,6 +635,7 @@ BEGIN
       FROM %3$s WHERE forecast_id = $1
       GROUP BY %1$I, model_name, %2$I
     $u$, dest_series_col, dest_season_col, dest_qual) USING latest_id;
+    CREATE INDEX ON __band_scores (series, model_name, yqm);
 
     EXECUTE format($u$ WITH s AS (
         SELECT sd.series, sd.model_name, sd.yqm, sd.season_start,
@@ -542,7 +666,10 @@ BEGIN
        WHERE t.%2$I = cv.series AND t.model_name = cv.model_name AND t.%3$I = cv.yqm
     $u$, dest_qual, dest_series_col, dest_season_col) USING latest_id;
 
-    -- CI selection (85/90/95)
+    IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
+
+    -- PASS 6 — CI selection (85/90/95) using prior-season coverage; write low/high from the chosen bands
+    RAISE NOTICE 'PASS 6 — CI select';
     EXECUTE 'DROP TABLE IF EXISTS __ci_pick';
     EXECUTE format($u$
       CREATE TEMP TABLE __ci_pick AS
@@ -554,28 +681,36 @@ BEGIN
       ),
       sel AS (
         SELECT c.series, c.model_name, c.yqm,
-               COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS x(i,cov)
-                         WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8) AS i85,
-               COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS x(i,cov)
-                         WHERE i > COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS y(i,cov)
-                                             WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8)
-                           AND cov >= 0.90 ORDER BY i LIMIT 1),
-                       LEAST(COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS y(i,cov)
-                                       WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8) + 1, 9)) AS i90,
-               COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS x(i,cov)
-                         WHERE i > LEAST(COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS y(i,cov)
-                                                    WHERE cov >= 0.90 AND i > COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS z(i,cov)
-                                                                                         WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8)) ORDER BY i LIMIT 1), 9)
-                           AND cov >= 0.95 ORDER BY i LIMIT 1),
-                       LEAST(COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS y(i,cov)
-                                       WHERE cov >= 0.90 AND i > COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS z(i,cov)
-                                                                           WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8)) ORDER BY i LIMIT 1, 9) + 1, 10)) AS i95
+               (SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS x(i,cov)
+                                  WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8)) AS i85,
+               (SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS x(i,cov)
+                                  WHERE i > (SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS y(i,cov)
+                                                               WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8))
+                                    AND cov >= 0.90 ORDER BY i LIMIT 1),
+                                  LEAST((SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS y(i,cov)
+                                                          WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8) + 1), 9))) AS i90,
+               (SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS x(i,cov)
+                                  WHERE i > (SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS y(i,cov)
+                                                               WHERE cov >= 0.90 AND i >
+                                                                     (SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS z(i,cov)
+                                                                                      WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8))
+                                                               ORDER BY i LIMIT 1),
+                                        LEAST((SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS y(i,cov)
+                                                                WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8) + 1), 9)))
+                                    AND cov >= 0.95 ORDER BY i LIMIT 1),
+                                  LEAST((SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS y(i,cov)
+                                                          WHERE cov >= 0.90 AND i >
+                                                                (SELECT COALESCE((SELECT i FROM (VALUES (1,c.b125_cov),(2,c.b150_cov),(3,c.b175_cov),(4,c.b200_cov),(5,c.b225_cov),(6,c.b250_cov),(7,c.b275_cov),(8,c.b300_cov),(9,c.b325_cov),(10,c.b350_cov)) AS z(i,cov)
+                                                                                 WHERE cov >= 0.85 ORDER BY i LIMIT 1), 8))
+                                                          ORDER BY i LIMIT 1), 9) + 1), 10))) AS i95
         FROM c
       )
       SELECT s.series, s.model_name, s.yqm, s.i85, s.i90, s.i95
       FROM sel s
     $u$, dest_series_col, dest_season_col, dest_qual) USING latest_id;
+    CREATE INDEX ON __ci_pick (series, model_name, yqm);
 
+    -- Write CI bounds from the selected bands (use current-season bounds fv_bXXX_*)
     EXECUTE format($u$
       UPDATE %1$s t
          SET ci85_low =
@@ -612,10 +747,14 @@ BEGIN
        WHERE t.%2$I = cp.series AND t.model_name = cp.model_name AND t.%3$I = cp.yqm
     $u$, dest_qual, dest_series_col, dest_season_col) USING latest_id;
 
-    -- A0/Ax comparisons + counts
+    IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
+
+    -- PASS 7 — A0/Ax comparisons + per-metric lagged counts; variance + comparisons (MAPE/MAE/RMSE)
+    RAISE NOTICE 'PASS 7 — A0/Ax comparisons + counts';
+    -- A0 caches for MAPE/MAE/RMSE
     EXECUTE 'DROP TABLE IF EXISTS __a0_map';
     EXECUTE format($u$
-      CREATE TEMP TABLE __a0_map AS
+      CREATE TEMPORARY TABLE __a0_map AS
       SELECT base_model, %1$I AS yqm,
              MAX(fv_mape)      AS mape0,
              MAX(fv_mean_mape) AS mean_mape0,
@@ -623,13 +762,17 @@ BEGIN
              MAX(fv_mean_mae)  AS mean_mae0,
              MAX(fv_rmse)      AS rmse0,
              MAX(fv_mean_rmse) AS mean_rmse0
-      FROM %2$s WHERE forecast_id = $1 AND fmsr_series = 'A0'
+      FROM %2$s WHERE forecast_id = $1 AND  fmsr_series = 'A0'
       GROUP BY base_model, %1$I
     $u$, dest_season_col, dest_qual) USING latest_id;
+    CREATE INDEX ON __a0_map (base_model, yqm);
+    ANALYZE __a0_map;
 
+    -- comparisons + variance (variance rule uses ci85 bounds)
     EXECUTE format($u$
       UPDATE %2$s t
          SET
+           -- variance (kept)
            fv_variance = CASE
                WHEN t.value IS NULL
                  OR (CASE WHEN t.value > t.ci85_low AND t.value < t.ci85_high THEN 'Y' ELSE 'N' END) = 'Y'
@@ -638,6 +781,7 @@ BEGIN
                                (t.value - t.ci85_high) / NULLIF(ABS(t.ci85_high),0),
                                (t.ci85_low - t.value) / NULLIF(ABS(t.ci85_low),0)
                             )::numeric, 4) END,
+           -- MAPE comparisons
            mape_comparison =
              CASE WHEN t.fmsr_series = 'A0' THEN NULL
                   WHEN t.fv_mape IS NULL OR a0.mape0 IS NULL THEN NULL
@@ -651,6 +795,7 @@ BEGIN
                   WHEN t.fv_mape IS NULL OR a0.mape0 IS NULL OR t.fv_mean_mape IS NULL OR a0.mean_mape0 IS NULL THEN NULL
                   WHEN (CASE WHEN t.fv_mape < a0.mape0 THEN 'L' ELSE 'H' END) = 'L'
                    AND (CASE WHEN t.fv_mean_mape < a0.mean_mape0 THEN 'L' ELSE 'H' END) = 'L' THEN 'Y' ELSE 'N' END,
+           -- MAE comparisons
            mae_comparison =
              CASE WHEN t.fmsr_series = 'A0' THEN NULL
                   WHEN t.fv_mae IS NULL OR a0.mae0 IS NULL THEN NULL
@@ -664,6 +809,7 @@ BEGIN
                   WHEN t.fv_mae IS NULL OR a0.mae0 IS NULL OR t.fv_mean_mae IS NULL OR a0.mean_mae0 IS NULL THEN NULL
                   WHEN (CASE WHEN t.fv_mae < a0.mae0 THEN 'L' ELSE 'H' END) = 'L'
                    AND (CASE WHEN t.fv_mean_mae < a0.mean_mae0 THEN 'L' ELSE 'H' END) = 'L' THEN 'Y' ELSE 'N' END,
+           -- RMSE comparisons
            rmse_comparison =
              CASE WHEN t.fmsr_series = 'A0' THEN NULL
                   WHEN t.fv_rmse IS NULL OR a0.rmse0 IS NULL THEN NULL
@@ -677,12 +823,15 @@ BEGIN
                   WHEN t.fv_rmse IS NULL OR a0.rmse0 IS NULL OR t.fv_mean_rmse IS NULL OR a0.mean_rmse0 IS NULL THEN NULL
                   WHEN (CASE WHEN t.fv_rmse < a0.rmse0 THEN 'L' ELSE 'H' END) = 'L'
                    AND (CASE WHEN t.fv_mean_rmse < a0.mean_rmse0 THEN 'L' ELSE 'H' END) = 'L' THEN 'Y' ELSE 'N' END
-      FROM __a0_map a0
-     WHERE t.base_model = a0.base_model
-       AND t.%1$I       = a0.yqm
+        FROM __a0_map a0
+       WHERE t.base_model = a0.base_model
+         AND t.%1$I       = a0.yqm
     $u$, dest_season_col, dest_qual) USING latest_id;
 
-    -- Lagged counts
+    IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
+
+    -- Per-metric lagged counts (prior seasons; partition by series,model_name ordered by season_start)
+    RAISE NOTICE 'PASS 7B — lagged counts';
     EXECUTE format($u$ WITH flags AS (
         SELECT
           %1$I AS series, model_name, %2$I AS yqm,
@@ -712,7 +861,10 @@ BEGIN
        WHERE t.%1$I = st.series AND t.model_name = st.model_name AND t.%2$I = st.yqm
     $u$, dest_series_col, dest_season_col, dest_qual) USING latest_id;
 
-    -- Clamp
+    IF enable_full_analyze THEN EXECUTE format('ANALYZE %s', dest_qual); END IF;
+
+    -- PASS 8 — clamp numerics to 4dp
+    RAISE NOTICE 'PASS 8 — clamp';
     EXECUTE format($c$ UPDATE %s SET
         value            = CASE WHEN value IS NULL THEN NULL ELSE round(value::numeric, 4) END,
         base_fv          = CASE WHEN base_fv IS NULL THEN NULL ELSE round(base_fv::numeric, 4) END,
@@ -768,15 +920,24 @@ BEGIN
         fv_variance_mean = CASE WHEN fv_variance_mean IS NULL THEN NULL ELSE round(fv_variance_mean::numeric, 4) END
     $c$, dest_qual) USING latest_id;
 
-    -- Commit work to destination
+    -- End-of-run write to real destination
     PERFORM set_config('synchronous_commit','off',true);
     EXECUTE format('DELETE FROM %s WHERE forecast_id = $1', dest_real_qual) USING latest_id;
     EXECUTE 'INSERT INTO '||dest_real_qual||' SELECT * FROM __work WHERE forecast_id = $1' USING latest_id;
 
-    RAISE NOTICE 'COMPLETE series: %', dest_rel;
+    RAISE NOTICE 'COMPLETE series: % (elapsed %.3f s)', dest_rel, EXTRACT(epoch FROM clock_timestamp() - t_series_start);
   END LOOP;
 
-  RAISE NOTICE 'ALL DONE (elapsed %.3f s)', EXTRACT(epoch FROM clock_timestamp() - t_run_start);
+
+-- Mark completion in forecast_registry (msq_complete -> 'complete')
+BEGIN
+  EXECUTE format('UPDATE engine.forecast_registry SET msq_complete = %s WHERE forecast_id = $1', quote_literal('complete')) USING latest_id;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Registry update for msq_complete failed: %', SQLERRM;
+END;
+
+
+  RAISE NOTICE 'ALL DONE (total elapsed %.3f s)', EXTRACT(epoch FROM clock_timestamp() - t_run_start);
 END
 $$;
 

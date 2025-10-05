@@ -1,3 +1,4 @@
+-- 2025-10-05: FIX — bands unclamped; lows now fv - (fv * (X * fv_mean_mape)); highs fv + (fv * (X * fv_mean_mape)).
 
 -- V14_08_FORECAST_MS.sql
 -- 2025-10-05: V14_08 — MS family: apply CANNON V13_09c logic with 10-band CI selection (85/90/95),
@@ -574,26 +575,26 @@ sr_base_col       := 'sr.' || quote_ident(base);
     EXECUTE format($u$
       UPDATE %1$s
          SET
-           fv_b125_u = fv + ((fv * fv_mean_mape) * 1.25),
-           fv_b125_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 1.25)),
-           fv_b150_u = fv + ((fv * fv_mean_mape) * 1.50),
-           fv_b150_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 1.50)),
-           fv_b175_u = fv + ((fv * fv_mean_mape) * 1.75),
-           fv_b175_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 1.75)),
-           fv_b200_u = fv + ((fv * fv_mean_mape) * 2.00),
-           fv_b200_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 2.00)),
-           fv_b225_u = fv + ((fv * fv_mean_mape) * 2.25),
-           fv_b225_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 2.25)),
-           fv_b250_u = fv + ((fv * fv_mean_mape) * 2.50),
-           fv_b250_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 2.50)),
-           fv_b275_u = fv + ((fv * fv_mean_mape) * 2.75),
-           fv_b275_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 2.75)),
-           fv_b300_u = fv + ((fv * fv_mean_mape) * 3.00),
-           fv_b300_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 3.00)),
-           fv_b325_u = fv + ((fv * fv_mean_mape) * 3.25),
-           fv_b325_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 3.25)),
-           fv_b350_u = fv + ((fv * fv_mean_mape) * 3.50),
-           fv_b350_l = GREATEST(0, fv - ((fv * fv_mean_mape) * 3.50))
+           fv_b125_u = fv + (fv * (1.25 * fv_mean_mape)),
+           fv_b125_l = fv - (fv * (1.25 * fv_mean_mape)),
+           fv_b150_u = fv + (fv * (1.50 * fv_mean_mape)),
+           fv_b150_l = fv - (fv * (1.50 * fv_mean_mape)),
+           fv_b175_u = fv + (fv * (1.75 * fv_mean_mape)),
+           fv_b175_l = fv - (fv * (1.75 * fv_mean_mape)),
+           fv_b200_u = fv + (fv * (2.00 * fv_mean_mape)),
+           fv_b200_l = fv - (fv * (2.00 * fv_mean_mape)),
+           fv_b225_u = fv + (fv * (2.25 * fv_mean_mape)),
+           fv_b225_l = fv - (fv * (2.25 * fv_mean_mape)),
+           fv_b250_u = fv + (fv * (2.50 * fv_mean_mape)),
+           fv_b250_l = fv - (fv * (2.50 * fv_mean_mape)),
+           fv_b275_u = fv + (fv * (2.75 * fv_mean_mape)),
+           fv_b275_l = fv - (fv * (2.75 * fv_mean_mape)),
+           fv_b300_u = fv + (fv * (3.00 * fv_mean_mape)),
+           fv_b300_l = fv - (fv * (3.00 * fv_mean_mape)),
+           fv_b325_u = fv + (fv * (3.25 * fv_mean_mape)),
+           fv_b325_l = fv - (fv * (3.25 * fv_mean_mape)),
+           fv_b350_u = fv + (fv * (3.50 * fv_mean_mape)),
+           fv_b350_l = fv - (fv * (3.50 * fv_mean_mape))
        WHERE fv_mean_mape IS NOT NULL
     $u$, dest_qual) USING latest_id;
 
